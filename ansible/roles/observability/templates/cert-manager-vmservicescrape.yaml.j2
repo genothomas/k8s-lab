@@ -1,0 +1,37 @@
+---
+# VMServiceScrape for cert-manager components (controller +
+# cainjector + webhook). All three pods expose Prometheus metrics on
+# container port 9402, but the cert-manager Helm chart uses
+# inconsistent Service port names:
+#   - cert-manager / cert-manager-cainjector: "http-metrics"
+#   - cert-manager-webhook: "metrics"
+#
+# Selector matches the Helm-managed instance label which is shared
+# across all three components. Two endpoint entries cover both Service
+# port name conventions.
+
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMServiceScrape
+metadata:
+  name: cert-manager
+  namespace: {{ monitoring_namespace }}
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/part-of: cert-manager
+spec:
+  namespaceSelector:
+    matchNames:
+      - cert-manager
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: cert-manager
+      app.kubernetes.io/managed-by: Helm
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

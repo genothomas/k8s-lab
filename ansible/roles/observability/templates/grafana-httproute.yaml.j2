@@ -1,0 +1,36 @@
+---
+# Grafana served via the existing web Gateway on its https
+# listener (port 443). HTTPRoute stays in monitoring ns (Gateway
+# allows routes from all namespaces); cert lives in web ns so the
+# Gateway can reference it without a ReferenceGrant.
+#
+# VM chart's grafana svc name: victoria-metrics-k8s-stack-grafana
+# (umbrella chart fullname prefix + "grafana").
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: grafana
+  namespace: {{ monitoring_namespace }}
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: web
+spec:
+  parentRefs:
+    - name: web
+      namespace: web
+      sectionName: https
+  hostnames:
+{% if enable_dns %}
+    - "grafana.{{ dns_subdomain }}.{{ dns_zone }}"
+{% else %}
+    - "grafana.{{ nip_apex }}"
+{% endif %}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: victoria-metrics-k8s-stack-grafana
+          port: 80

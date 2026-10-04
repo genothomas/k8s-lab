@@ -1,0 +1,53 @@
+---
+- name: Add cert-manager Helm repo
+  ansible.builtin.command:
+    cmd: helm repo add {{ cert_manager_chart_repo }} {{ cert_manager_chart_url }}
+  register: helm_repo_add
+  changed_when: "'has been added' in helm_repo_add.stdout"
+  when: not ansible_check_mode
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Install cert-manager CRDs
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.crds.yaml
+  register: cert_manager_crds
+  changed_when: "'created' in cert_manager_crds.stdout or 'configured' in cert_manager_crds.stdout"
+  when: not ansible_check_mode
+
+- name: Create cert-manager namespace
+  ansible.builtin.shell:
+    cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf create namespace {{ cert_manager_namespace }} --dry-run=client -o yaml | kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+  register: cm_ns
+  changed_when: "'created' in cm_ns.stdout or 'configured' in cm_ns.stdout"
+  when: not ansible_check_mode
+
+- name: Render cert-manager chart overrides
+  ansible.builtin.template:
+    src: cert-manager-overrides.yaml.j2
+    dest: /tmp/cert-manager-overrides.yaml
+    mode: "0644"
+  when: not ansible_check_mode
+
+- name: Install cert-manager
+  ansible.builtin.command:
+    cmd: >-
+      helm upgrade --install cert-manager {{ cert_manager_chart_name }}
+      --version {{ cert_manager_version | regex_replace('^v', '') }}
+      --namespace {{ cert_manager_namespace }}
+      --kubeconfig=/etc/kubernetes/admin.conf
+      -f /tmp/cert-manager-overrides.yaml
+      --wait --timeout 10m
+  register: cert_manager_install
+  changed_when: "'STATUS: deployed' in cert_manager_install.stdout"
+  when: not ansible_check_mode
+
+- name: Wait for cert-manager webhook
+  ansible.builtin.command:
+    cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf -n {{ cert_manager_namespace }} rollout status deploy/cert-manager-webhook --timeout=120s
+  register: cm_webhook
+  changed_when: false
+  when: not ansible_check_mode

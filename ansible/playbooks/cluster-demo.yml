@@ -1,0 +1,84 @@
+---
+- name: Apply demo app (podinfo)
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+    demo_dir: /home/ubuntu/apps/demo
+  tasks:
+    - name: Ensure demo dir exists
+      ansible.builtin.file:
+        path: "{{ demo_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy non-templated manifests
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ demo_dir }}/{{ item | basename }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+      loop:
+        - ../apps/demo/00-namespace.yaml
+        - ../apps/demo/10-deployment.yaml
+        - ../apps/demo/20-service.yaml
+
+    - name: Render HTTPRoute
+      ansible.builtin.template:
+        src: ../apps/demo/30-httproute.yaml.j2
+        dest: "{{ demo_dir }}/30-httproute.yaml"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
+    - name: Apply + verify demo
+      when: not ansible_check_mode
+      block:
+        - name: kubectl apply all manifests
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} apply
+              -f {{ demo_dir }}/00-namespace.yaml
+              -f {{ demo_dir }}/10-deployment.yaml
+              -f {{ demo_dir }}/20-service.yaml
+              -f {{ demo_dir }}/30-httproute.yaml
+          register: demo_apply
+          changed_when: "'configured' in demo_apply.stdout or 'created' in demo_apply.stdout"
+
+        - name: Print apply result
+          ansible.builtin.debug: { var: demo_apply.stdout_lines }
+
+        - name: Wait for podinfo rollout
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n demo rollout status deployment/podinfo --timeout=120s
+          changed_when: false
+
+        - name: Show pods + HTTPRoute
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n demo get {{ item }} -o wide
+          loop:
+            - pods
+            - httproute/podinfo
+          register: demo_status
+          changed_when: false
+
+        - name: Print status
+          ansible.builtin.debug:
+            var: demo_status.results | map(attribute='stdout_lines') | list
+
+        - name: Local curl test
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} -n demo
+              exec deploy/podinfo -- curl -s http://podinfo.demo.svc.cluster.local/
+          register: local_curl
+          changed_when: false
+          retries: 3
+          delay: 5
+          until: local_curl.rc == 0
+
+        - name: Print local curl
+          ansible.builtin.debug: { var: local_curl.stdout_lines }

@@ -1,0 +1,25 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: redirect
+  namespace: web
+  labels:
+    app.kubernetes.io/name: redirect
+    app.kubernetes.io/part-of: web
+spec:
+  parentRefs:
+    - name: web
+      namespace: web
+      sectionName: http
+  hostnames:
+{% if enable_dns %}
+    - "{{ dns_subdomain }}.{{ dns_zone }}"
+{% else %}
+    - "grafana.{{ nip_apex }}"
+{% endif %}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

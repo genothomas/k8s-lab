@@ -1,0 +1,29 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: podinfo
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: podinfo
+    app.kubernetes.io/part-of: demo
+spec:
+  parentRefs:
+    - name: web
+      namespace: web
+      sectionName: https
+  hostnames:
+{% if enable_dns %}
+    - "pod.{{ dns_subdomain }}.{{ dns_zone }}"
+    - "demo.{{ dns_subdomain }}.{{ dns_zone }}"
+{% else %}
+    - "pod.{{ nip_apex }}"
+    - "demo.{{ nip_apex }}"
+{% endif %}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: podinfo
+          port: 80

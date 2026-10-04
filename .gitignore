@@ -1,0 +1,36 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+.terraform.lock.hcl
+
+# Terraform variable/secrets files
+*.tfvars
+*.tfvars.json
+
+# Ansible
+*.retry
+__pycache__/
+*.pyc
+ansible/inventory/hosts.yml
+
+# Secrets / local config
+.env
+.env.*
+*.secret
+secrets/
+
+# SSH / generated credentials
+*.pem
+*.key
+*.pub
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/

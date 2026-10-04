@@ -1,0 +1,14 @@
+---
+- name: Configure NAT on edge (MASQUERADE + FORWARD + rule persistence)
+  # Must run before any host tries apt — private nodes need NAT to reach
+  # package repos.
+  hosts: edge
+  become: true
+  roles:
+    - nat
+
+- name: Bootstrap all hosts (baseline packages, timezone, chrony)
+  hosts: all
+  become: true
+  roles:
+    - common

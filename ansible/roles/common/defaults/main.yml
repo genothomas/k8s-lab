@@ -1,0 +1,7 @@
+---
+common_packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - apt-transport-https
+  - chrony

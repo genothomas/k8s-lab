@@ -1,0 +1,18 @@
+---
+# emptyDir storage — restart loses metrics history.
+
+monitoring_namespace: monitoring
+
+vm_chart_repo: vm
+vm_chart_name: vm/victoria-metrics-k8s-stack
+vm_chart_url: https://victoriametrics.github.io/helm-charts
+vm_version: "0.95.0"
+
+# Default admin/admin — change before any non-lab exposure.
+grafana_admin_user: admin
+grafana_admin_password: wittysilk63
+
+retention_hours: 24
+
+# Toggle for demo app ServiceMonitor. Off if demo app doesn't expose /metrics.
+enable_demo_metrics_servicemonitor: true

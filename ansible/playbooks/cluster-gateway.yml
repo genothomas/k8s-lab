@@ -1,0 +1,172 @@
+---
+- name: Migrate Cilium to Gateway API
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+    cilium_namespace: kube-system
+    cilium_version: "1.20.2"
+    cilium_chart_repo: cilium
+    cilium_chart_name: cilium/cilium
+    gateway_api_version: "1.6.2"
+    cilium_kube_proxy_replacement: true
+    cilium_ipam_mode: kubernetes
+    cilium_hubble_enabled: true
+    cilium_k8s_service_host: "{{ kubernetes_control_plane_endpoint.split(':')[0] }}"
+    cilium_k8s_service_port: "{{ kubernetes_control_plane_endpoint.split(':')[1] }}"
+    web_dir: /home/ubuntu/apps/web
+  tasks:
+    - name: Install Gateway API CRDs (standard channel)
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply --server-side --force-conflicts -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v{{ gateway_api_version }}/standard-install.yaml
+      register: gw_crds
+      changed_when: "'created' in gw_crds.stdout or 'configured' in gw_crds.stdout or 'serverside-applied' in gw_crds.stdout"
+      when: not ansible_check_mode
+
+    - name: Verify GatewayClass cilium exists
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} get gatewayclass cilium
+      register: gwclass_check
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    # cilium-operator reads Gateway API CRDs only at pod start. On a fresh
+    # cluster cluster.yml installs Cilium (no CRDs yet), so the operator
+    # never starts the gateway controller. Restart it after CRDs exist.
+    - name: Restart cilium-operator (pick up CRDs)
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout restart deploy/cilium-operator
+      register: op_restart
+      changed_when: "'restarted' in op_restart.stdout"
+      when: not ansible_check_mode
+
+    - name: Wait for cilium-operator rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status deploy/cilium-operator --timeout=120s
+      register: op_status
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Render Cilium chart overrides
+      ansible.builtin.template:
+        src: ../roles/cni/templates/cilium-overrides.yaml.j2
+        dest: /tmp/cilium-overrides.yaml
+        mode: "0644"
+
+    - name: Upgrade Cilium — Gateway API enabled, Ingress disabled
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade cilium {{ cilium_chart_name }}
+          --version {{ cilium_version }}
+          --namespace {{ cilium_namespace }}
+          --kubeconfig={{ kubeconfig }}
+          --set kubeProxyReplacement={{ cilium_kube_proxy_replacement }}
+          --set k8sServiceHost={{ cilium_k8s_service_host }}
+          --set k8sServicePort={{ cilium_k8s_service_port }}
+          --set ipam.mode={{ cilium_ipam_mode }}
+          --set hubble.enabled={{ cilium_hubble_enabled }}
+          --set ingressController.enabled=false
+          --set ingressController.default=false
+          --set gatewayAPI.enabled=true
+          --set gatewayAPI.hostNetwork.enabled=true
+          -f /tmp/cilium-overrides.yaml
+          --wait --timeout 10m
+      register: cilium_upgrade
+      changed_when: "'UPGRADED RELEASE' in cilium_upgrade.stdout"
+      when: not ansible_check_mode
+
+    - name: Wait for cilium DaemonSet rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status ds/cilium --timeout=300s
+      register: ds_rollout
+      changed_when: false
+      when: not ansible_check_mode
+
+    # cilium-operator reads --gateway-api-hostnetwork-enabled at pod start
+    # (not on ConfigMap reload), so `helm upgrade --reuse-values` does not
+    # restart it. Without this restart it stays at false, creating a
+    # NodePort instead of binding host 80/443.
+    - name: Restart cilium-operator (apply hostNetwork flag)
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout restart deploy/cilium-operator
+      register: op_restart_gw
+      changed_when: "'restarted' in op_restart_gw.stdout"
+      when: not ansible_check_mode
+
+    - name: Wait for cilium-operator rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status deploy/cilium-operator --timeout=180s
+      register: op_status_gw
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Ensure web dir exists
+      ansible.builtin.file:
+        path: "{{ web_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy non-templated web manifests
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ web_dir }}/{{ item | basename }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+      loop:
+        - ../apps/web/00-namespace.yaml
+        - ../apps/web/30-gateway.yaml
+
+    - name: Render redirect HTTPRoute
+      ansible.builtin.template:
+        src: ../apps/web/40-redirect.yaml.j2
+        dest: "{{ web_dir }}/40-redirect.yaml"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
+    - name: Apply + verify
+      when: not ansible_check_mode
+      block:
+        - name: kubectl apply web manifests
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} apply
+              -f {{ web_dir }}/00-namespace.yaml
+              -f {{ web_dir }}/30-gateway.yaml
+              -f {{ web_dir }}/40-redirect.yaml
+          register: gw_apply
+          changed_when: "'configured' in gw_apply.stdout or 'created' in gw_apply.stdout"
+
+        - name: Print apply result
+          ansible.builtin.debug: { var: gw_apply.stdout_lines }
+
+        - name: Show cilium pods
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} get pods -l k8s-app=cilium -o wide
+          register: cilium_pods
+          changed_when: false
+
+        - name: Print cilium pods
+          ansible.builtin.debug: { var: cilium_pods.stdout_lines }
+
+        - name: Show Gateway status
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n web get gateway web -o wide
+          register: gw_status
+          changed_when: false
+
+        - name: Print Gateway status
+          ansible.builtin.debug: { var: gw_status.stdout_lines }
+
+        - name: Gateway test summary
+          ansible.builtin.debug:
+            msg: |
+              Web tier PASSED if:
+                - Gateway `web` Programmed=True
+                - cilium-envoy bound host 80/443 (ADDRESS column populated)
+                - HTTPRoute `redirect` (web ns) returns 301 from any Host on :80
+                - HTTPRoute(s) attached via cluster-cert.yml + cluster-observability.yml

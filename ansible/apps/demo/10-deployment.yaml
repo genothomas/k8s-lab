@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: podinfo
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: podinfo
+    app.kubernetes.io/part-of: demo
+    app.kubernetes.io/component: demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: podinfo
+      app.kubernetes.io/part-of: demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: podinfo
+        app.kubernetes.io/part-of: demo
+        app.kubernetes.io/component: demo
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Spread one pod per node so curl-refresh hits a different node each time.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: podinfo
+                  app.kubernetes.io/part-of: demo
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: podinfo
+          image: stefanprodan/podinfo:6.5.0
+          ports:
+            - containerPort: 9898
+              name: http
+          env:
+            - name: PODINFO_UI_COLOR
+              value: "#34577c"
+            - name: PODINFO_UI_MESSAGE
+              value: "hello from podinfo"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName

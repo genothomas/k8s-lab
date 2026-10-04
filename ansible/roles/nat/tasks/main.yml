@@ -1,0 +1,67 @@
+---
+- name: Configure NAT on edge
+  when: edge_enable_nat | bool
+  block:
+    - name: Preseed iptables-persistent to save current rules on install (non-interactive)
+      ansible.builtin.debconf:
+        name: "iptables-persistent"
+        question: "{{ item.question }}"
+        value: "{{ item.value }}"
+        vtype: "{{ item.vtype }}"
+      loop:
+        - { question: "iptables-persistent/autosave_v4", value: "true", vtype: "boolean" }
+        - { question: "iptables-persistent/autosave_v6", value: "true", vtype: "boolean" }
+
+    - name: Enable IPv4 forwarding (NAT requirement)
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        sysctl_set: true
+        reload: true
+
+    - name: Add MASQUERADE rule for private-subnet egress (RFC1918 → edge public IP)
+      ansible.builtin.iptables:
+        table: nat
+        chain: POSTROUTING
+        source: "{{ vpc_cidr }}"
+        out_interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+        jump: MASQUERADE
+        comment: "k8s-lab: NAT private subnet for internet egress"
+
+    - name: Allow established/related traffic FORWARD (return path)
+      ansible.builtin.iptables:
+        chain: FORWARD
+        match: conntrack
+        ctstate: ESTABLISHED,RELATED
+        jump: ACCEPT
+        comment: "k8s-lab: allow return traffic"
+
+    - name: Allow new outbound FORWARD from private subnet
+      ansible.builtin.iptables:
+        chain: FORWARD
+        source: "{{ vpc_cidr }}"
+        out_interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+        jump: ACCEPT
+        comment: "k8s-lab: allow outbound from VPC"
+
+    - name: Allow inbound FORWARD replies to private subnet
+      ansible.builtin.iptables:
+        chain: FORWARD
+        destination: "{{ vpc_cidr }}"
+        in_interface: "{{ ansible_facts['default_ipv4']['interface'] }}"
+        jump: ACCEPT
+        comment: "k8s-lab: allow inbound to VPC"
+
+    - name: Install iptables-persistent
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Persist iptables rules across reboot
+      ansible.builtin.command:
+        cmd: netfilter-persistent save
+      changed_when: true

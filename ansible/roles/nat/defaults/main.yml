@@ -1,0 +1,5 @@
+---
+# Set true when the edge instance also acts as the NAT (source/dest check
+# disabled on its ENI, iptables MASQUERADE for private-subnet egress).
+# Matches terraform var.edge_enable_nat — keep them in sync.
+edge_enable_nat: true

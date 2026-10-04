@@ -1,0 +1,24 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+  namespace: web
+  labels:
+    app.kubernetes.io/name: web-tls
+    app.kubernetes.io/part-of: web
+spec:
+  secretName: web-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+{% if enable_dns %}
+    - "{{ dns_subdomain }}.{{ dns_zone }}"
+    - "*.{{ dns_subdomain }}.{{ dns_zone }}"
+{% else %}
+    - "grafana.{{ nip_apex }}"
+    - "pod.{{ nip_apex }}"
+    - "demo.{{ nip_apex }}"
+{% endif %}
+  duration: 2160h
+  renewBefore: 720h

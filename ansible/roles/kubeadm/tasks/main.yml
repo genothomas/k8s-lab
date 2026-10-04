@@ -1,0 +1,67 @@
+---
+- name: kubeadm init on first control plane
+  ansible.builtin.command:
+    cmd: >-
+      kubeadm init
+      --control-plane-endpoint={{ kubernetes_control_plane_endpoint }}
+      --pod-network-cidr={{ kubernetes_pod_subnet }}
+      --service-cidr={{ kubernetes_service_subnet }}
+      --upload-certs
+      --node-name={{ inventory_hostname }}
+      --apiserver-cert-extra-sans={{ kubernetes_api_endpoint_host }}
+      {% if kubeadm_skip_kube_proxy %}--skip-phases=addon/kube-proxy{% endif %}
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init_result
+  when: kubeadm_run_init | default(false) and not ansible_check_mode
+
+- name: Generate certificate key for control-plane join
+  ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+  register: kubeadm_upload_certs
+  changed_when: false
+  when: kubeadm_run_init | default(false) and not ansible_check_mode
+
+- name: Get join command (used by both control-plane join and worker join)
+  ansible.builtin.command: kubeadm token create --print-join-command
+  register: kubeadm_join_command
+  changed_when: false
+  when: kubeadm_run_init | default(false) and not ansible_check_mode
+
+- name: Ensure kube config directory exists
+  ansible.builtin.file:
+    path: /home/ubuntu/.kube
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0755"
+  when: (kubeadm_run_init | default(false) or kubeadm_run_join | default(false)) and not ansible_check_mode
+
+- name: Install kubeconfig for ubuntu user (init node)
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: true
+    owner: ubuntu
+    group: ubuntu
+    mode: "0600"
+  when: kubeadm_run_init | default(false) and not ansible_check_mode
+
+- name: kubeadm join as control plane
+  ansible.builtin.command:
+    cmd: >-
+      {{ hostvars[groups['control_plane'][0]]['kubeadm_join_command'].stdout }}
+      --control-plane
+      --certificate-key {{ hostvars[groups['control_plane'][0]]['kubeadm_upload_certs'].stdout_lines[-1] }}
+      --node-name={{ inventory_hostname }}
+    creates: /etc/kubernetes/kubelet.conf
+  register: kubeadm_join_result
+  when: kubeadm_run_join | default(false) and not ansible_check_mode
+
+- name: Install kubeconfig for ubuntu user (joiner)
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /home/ubuntu/.kube/config
+    remote_src: true
+    owner: ubuntu
+    group: ubuntu
+    mode: "0600"
+  when: kubeadm_run_join | default(false) and not ansible_check_mode

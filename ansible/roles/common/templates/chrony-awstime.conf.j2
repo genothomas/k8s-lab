@@ -1,0 +1,9 @@
+# AWS time service (link-local IP, low-latency, no egress required).
+# Primary: instance-time metadata service.
+server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+# Public AWS time DNS (fallback if link-local unreachable).
+server time.aws.com iburst minpoll 4 maxpoll 4
+# Fallback pool if AWS time is unreachable.
+pool ntp.ubuntu.com iburst maxsources 4 maxpoll 8
+makestep 1.0 3
+rtcsync

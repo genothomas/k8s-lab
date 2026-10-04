@@ -1,0 +1,27 @@
+---
+helm_version: "v3.16.3"
+
+cilium_version: "1.20.2"
+cilium_namespace: kube-system
+cilium_chart_repo: cilium
+cilium_chart_name: cilium/cilium
+cilium_chart_url: https://helm.cilium.io
+
+# Replace kube-proxy. Requires kubeadm init to --skip-phases=addon/kube-proxy.
+cilium_kube_proxy_replacement: true
+
+# IPAM mode. 'kubernetes' uses pod CIDR from node spec; 'cluster-pool' uses CRDs.
+cilium_ipam_mode: kubernetes
+
+cilium_hubble_enabled: true
+
+# Cilium Gateway API (GatewayClass: cilium). Lab has no Ingress resources;
+# the Cilium Ingress controller stays disabled to avoid host port 80/443
+# conflicts with the Gateway listener.
+cilium_gateway_api_enabled: true
+
+# API server address cilium uses directly, bypassing in-cluster DNS
+# (coredns isn't up at install time — chicken-and-egg with no CNI).
+# Override only if your control-plane topology differs.
+cilium_k8s_service_host: "{{ kubernetes_control_plane_endpoint.split(':')[0] }}"
+cilium_k8s_service_port: "{{ kubernetes_control_plane_endpoint.split(':')[1] }}"

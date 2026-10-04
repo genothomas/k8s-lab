@@ -1,0 +1,53 @@
+---
+# Lab alerts not covered by the VM chart's defaultRules.
+# VM chart uses VMRule (operator.victoriametrics.com/v1beta1) — same
+# expression syntax as PrometheusRule, vmalert evaluates both.
+
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMRule
+metadata:
+  name: lab-custom-rules
+  namespace: {{ monitoring_namespace }}
+  labels:
+    app.kubernetes.io/name: lab-custom-rules
+spec:
+  groups:
+    - name: lab.cluster
+      interval: 30s
+      rules:
+        - alert: NodeCPUHighSustained
+          expr: |
+            100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+          for: 15m
+          labels:
+            severity: warning
+            team: sre
+            source: lab
+          annotations:
+            summary: "Node CPU >85% for 15m"
+            description: "Node {% raw %}{{ $labels.instance }}{% endraw %} CPU at {% raw %}{{ printf \"%.0f\" $value }}{% endraw %}% sustained for 15+ minutes."
+            runbook_url: "https://runbooks.{{ dns_zone }}/node-cpu-high"
+        - alert: CertificateExpiringSoon
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 14
+          for: 5m
+          labels:
+            severity: warning
+            team: sre
+            source: cert-manager
+          annotations:
+            summary: "TLS cert expires in <14 days"
+            description: "Cert {% raw %}{{ $labels.namespace }}/{{ $labels.name }}{% endraw %} expires in {% raw %}{{ printf \"%.1f\" $value }}{% endraw %} days."
+            runbook_url: "https://runbooks.{{ dns_zone }}/cert-expiry"
+        - alert: CertificateExpiringCritical
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 3
+          for: 5m
+          labels:
+            severity: critical
+            team: sre
+            source: cert-manager
+          annotations:
+            summary: "TLS cert expires in <3 days"
+            description: "Cert {% raw %}{{ $labels.namespace }}/{{ $labels.name }}{% endraw %} expires in {% raw %}{{ printf \"%.1f\" $value }}{% endraw %} days — renew now."
+            runbook_url: "https://runbooks.{{ dns_zone }}/cert-expiry"

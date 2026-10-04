@@ -1,0 +1,6 @@
+---
+- name: Configure HAProxy edge node
+  hosts: edge
+  become: true
+  roles:
+    - haproxy

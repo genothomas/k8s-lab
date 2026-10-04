@@ -1,0 +1,28 @@
+---
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+- name: Set timezone to Asia/Kolkata
+  community.general.timezone:
+    name: Asia/Kolkata
+
+- name: Drop AWS time service config (chrony include)
+  ansible.builtin.template:
+    src: chrony-awstime.conf.j2
+    dest: /etc/chrony/conf.d/awstime.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart chrony
+
+- name: Enable chrony
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true

@@ -1,0 +1,10 @@
+---
+- name: Install observability stack
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+    monitor: "{{ monitoring_namespace }}"
+    release: victoria-metrics-k8s-stack
+  roles:
+    - role: observability

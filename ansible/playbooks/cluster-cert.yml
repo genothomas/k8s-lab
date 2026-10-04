@@ -1,0 +1,103 @@
+---
+- name: Install cert-manager
+  hosts: node-01
+  become: true
+  roles:
+    - role: cert_manager
+
+- name: Apply ClusterIssuer + Certificate
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+    cert_dir: /home/ubuntu/apps/web
+    # From CLOUDFLARE_API_TOKEN env. Unused when enable_dns=false.
+    cloudflare_api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') | default('', true) }}"
+  tasks:
+    - name: Ensure apps dir exists
+      ansible.builtin.file:
+        path: "{{ cert_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Render ClusterIssuer + Certificate
+      ansible.builtin.template:
+        src: "../apps/web/{{ item }}"
+        dest: "{{ cert_dir }}/{{ item | regex_replace('\\.j2$', '') }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+      loop:
+        - 50-cluster-issuer.yaml.j2
+        - 60-certificate.yaml.j2
+
+    - name: Apply Cloudflare API token Secret
+      ansible.builtin.shell:
+        cmd: |
+          cat <<'EOF' | kubectl --kubeconfig={{ kubeconfig }} apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cloudflare-api-token
+            namespace: cert-manager
+          type: Opaque
+          stringData:
+            api-token: "{{ cloudflare_api_token }}"
+          EOF
+      register: cf_token_apply
+      changed_when: "'created' in cf_token_apply.stdout or 'configured' in cf_token_apply.stdout"
+      when:
+        - enable_dns | bool
+        - cloudflare_api_token | length > 0
+      no_log: true
+
+    - name: Apply + wait for ClusterIssuer + Certificate
+      when: not ansible_check_mode
+      block:
+        - name: Apply ClusterIssuer
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f {{ cert_dir }}/50-cluster-issuer.yaml
+          register: issuer_apply
+          changed_when: "'configured' in issuer_apply.stdout or 'created' in issuer_apply.stdout"
+
+        - name: Wait for ClusterIssuer Ready
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=120s
+          register: issuer_wait
+          changed_when: false
+
+        - name: Apply Certificate
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f {{ cert_dir }}/60-certificate.yaml
+          register: cert_apply
+          changed_when: "'configured' in cert_apply.stdout or 'created' in cert_apply.stdout"
+
+        # DNS-01 typically ~90s; HTTP-01 can take up to 5 min.
+        - name: Wait for Certificate Ready
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n web wait --for=condition=Ready certificate/web-tls --timeout=300s
+          register: cert_wait
+          changed_when: false
+
+    - name: Show Certificate + Secret
+      when: not ansible_check_mode
+      block:
+        - name: Describe Certificate
+          ansible.builtin.shell:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n web describe certificate web-tls | tail -25
+          register: cert_describe
+          changed_when: false
+
+        - name: Print Certificate
+          ansible.builtin.debug: { var: cert_describe.stdout_lines }
+
+        - name: Get TLS Secret
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} -n web get secret web-tls
+          register: tls_secret
+          changed_when: false
+
+        - name: Print TLS Secret
+          ansible.builtin.debug: { var: tls_secret.stdout_lines }

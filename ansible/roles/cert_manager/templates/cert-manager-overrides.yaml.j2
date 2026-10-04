@@ -1,0 +1,9 @@
+crds:
+  enabled: false
+
+# Without --enable-gateway-api cert-manager's HTTP-01 solver silently
+# refuses to route through a Gateway listener and challenges stay
+# pending forever. GA since cert-manager 1.21 — only the startup flag
+# is needed.
+extraArgs:
+  - --enable-gateway-api

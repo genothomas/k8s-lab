@@ -1,0 +1,4 @@
+---
+kubelet_service: kubelet
+kubeadm_binary: kubeadm
+kubectl_binary: kubectl

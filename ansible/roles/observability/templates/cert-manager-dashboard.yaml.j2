@@ -1,0 +1,186 @@
+---
+# Grafana ConfigMap dashboard for cert-manager.
+# Provisioned via sidecar.dashboards.label=grafana_dashboard.
+# Panels: cert counts, ready/not-ready, days-to-expiry, controller sync rate.
+# Metrics prefix certmanager_* (cert-manager 1.7+).
+# Note: Grafana legend templates wrapped in raw blocks so Ansible
+# Jinja2 does not try to evaluate them.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-manager-overview
+  namespace: {{ monitoring_namespace }}
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/part-of: cert-manager
+data:
+  cert-manager.json: |
+    {
+      "title": "Cert-Manager / Certificates",
+      "uid": "cert-manager",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": { "from": "now-6h", "to": "now" },
+      "tags": ["cert-manager", "certificates"],
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "query": "label_values(certmanager_certificate_ready_status, namespace)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true
+          },
+          {
+            "name": "name",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "query": "label_values(certmanager_certificate_ready_status{namespace=~\"$namespace\"}, name)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Certificates Total",
+          "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "count(certmanager_certificate_ready_status{namespace=~\"$namespace\", name=~\"$name\"})",
+              "legendFormat": "total"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "graphMode": "none",
+            "colorMode": "value"
+          }
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Certificates Ready",
+          "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "sum(certmanager_certificate_ready_status{condition=\"True\", namespace=~\"$namespace\", name=~\"$name\"})",
+              "legendFormat": "ready"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "graphMode": "none",
+            "colorMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "Certificates Not Ready",
+          "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "count(certmanager_certificate_ready_status{condition=\"False\", namespace=~\"$namespace\", name=~\"$name\"})",
+              "legendFormat": "not ready"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "graphMode": "none",
+            "colorMode": "value"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 4,
+          "type": "timeseries",
+          "title": "Days Until Certificate Expiry",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "(certmanager_certificate_expiration_timestamp_seconds{namespace=~\"$namespace\", name=~\"$name\"} - time()) / 86400",
+              "legendFormat": "{% raw %}{{namespace}}/{{name}}{% endraw %}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "decimals": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 7 },
+                  { "color": "green", "value": 30 }
+                ]
+              }
+            }
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "min"] }
+          }
+        },
+        {
+          "id": 5,
+          "type": "timeseries",
+          "title": "Controller Sync Rate (ops)",
+          "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "rate(certmanager_controller_sync_time_seconds_count[5m])",
+              "legendFormat": "{% raw %}{{controller}}{% endraw %}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "ops" } }
+        },
+        {
+          "id": 6,
+          "type": "timeseries",
+          "title": "ACME Client Request Rate",
+          "gridPos": { "x": 12, "y": 14, "w": 12, "h": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "rate(certmanager_acme_client_request_count[5m])",
+              "legendFormat": "{% raw %}{{action}}/{{status_code}}{% endraw %}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "reqps" } }
+        }
+      ]
+    }

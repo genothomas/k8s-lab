@@ -1,0 +1,154 @@
+---
+# victoria-metrics-k8s-stack Helm overrides.
+# Single-node lab: vmsingle + vmagent + vmalert + vmauth + alertmanager + grafana.
+# Storage: emptyDir — restart loses metrics, acceptable for lab.
+
+victoria-metrics-operator:
+  serviceAccount:
+    create: true
+
+vmsingle:
+  enabled: true
+  spec:
+    retentionPeriod: "{{ retention_hours }}h"
+    replicaCount: 1
+    # Drop storage so operator falls back to emptyDir — restart loses metrics.
+    storage: null
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+vmagent:
+  enabled: true
+  rbac:
+    namespaced: true
+  spec:
+    port: "8429"
+    selectAllByDefault: true
+    scrapeInterval: 30s
+    externalLabels:
+      cluster: "{{ cluster_name | default('lab') }}"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+
+vmalert:
+  enabled: true
+  remoteWriteVMAgent: false
+  spec:
+    port: "8080"
+    selectAllByDefault: true
+    evaluationInterval: 30s
+    externalLabels:
+      cluster: "{{ cluster_name | default('lab') }}"
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
+vmauth:
+  enabled: true
+  spec:
+    unauthorizedUserAccessSpec:
+      disabled: false
+      discover_backend_ips: true
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
+alertmanager:
+  enabled: true
+  spec:
+    # configSecret is the operator CR field. Chart's spec.configSecret
+    # is checked; if unset, an operator-generated secret is used. The
+    # reloader reads `alertmanager.yaml.gz` from whatever Secret this points at.
+    configSecret: alertmanager-vm-external
+
+grafana:
+  enabled: true
+  adminUser: "{{ grafana_admin_user }}"
+  adminPassword: "{{ grafana_admin_password }}"
+  persistence:
+    enabled: false
+  defaultDashboardsEnabled: true
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://vmauth-victoria-metrics-k8s-stack.{{ monitoring_namespace }}.svc.cluster.local:8427
+          isDefault: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+kube-state-metrics:
+  enabled: true
+prometheus-node-exporter:
+  enabled: true
+
+# Watchdog, KubePodCrashLooping, KubeAPIDown, etc.
+defaultRules:
+  enabled: true
+defaultDashboards:
+  enabled: true
+# Chart's bundled VM datasource ships with isDefault: true, colliding with
+# our `grafana.datasources` Prometheus datasource. Override chart's default
+# to false so ours wins. Cannot use [] — chart templates index [0].
+defaultDatasources:
+  victoriametrics:
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        access: proxy
+        uid: VictoriaMetrics
+        isDefault: false
+      - name: VictoriaMetrics (DS)
+        isDefault: false
+        access: proxy
+        uid: VictoriaMetricsDS
+        type: victoriametrics-metrics-datasource
+        plugin: true
+  alertmanager:
+    datasources:
+      - name: Alertmanager
+        access: proxy
+        uid: Alertmanager
+        jsonData:
+          implementation: prometheus
+
+# kubeadm binds kube-scheduler (10259) + kube-controller-manager (10257) to
+# 127.0.0.1 with hostNetwork:true; etcd on 127.0.0.1:2381. VMServiceScrapes
+# target pod IPs → unreachable. kube-apiserver (6446) still works via Service VIP.
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeControllerManager:
+  enabled: false

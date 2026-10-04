@@ -1,0 +1,49 @@
+# k8s-lab (cluster: nexus, environment: dev) — example tfvars.
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+
+cluster_name = "nexus"
+environment  = "dev"
+aws_region   = "ap-south-1"
+
+availability_zones = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+
+vpc_cidr             = "10.40.0.0/16"
+public_subnet_cidrs  = ["10.40.0.0/24", "10.40.1.0/24", "10.40.2.0/24"]
+private_subnet_cidrs = ["10.40.10.0/24", "10.40.11.0/24", "10.40.12.0/24"]
+
+# Replace with the path to your local SSH public keys. Default below assumes
+# you generated ed25519 keys named nexus_edge and nexus_nodes.
+edge_public_key_path  = "~/.ssh/nexus_edge.pub"
+nodes_public_key_path = "~/.ssh/nexus_nodes.pub"
+
+# Replace with your real public IP /32 before applying.
+ssh_admin_cidrs = ["13.206.252.106/32", "103.189.143.252/32"]
+
+# API server locked to admin IPs — kubectl from the LAN needs ProxyJump
+# through edge-01 or VPN, not direct public access. Add extra IPs here
+# if you VPN in from elsewhere.
+kubernetes_api_allowed_cidrs = ["13.206.252.106/32", "103.189.143.252/32"]
+
+# HTTP/HTTPS stay open — HAProxy fronts the public apps.
+http_allowed_cidrs = ["0.0.0.0/0"]
+
+edge_instance_type = "t3a.micro"
+node_instance_type = "t3a.medium"
+root_volume_size   = 30
+
+# Optional — set true to allocate an Elastic IP for edge-01.
+enable_elastic_ip = false
+
+# Cloudflare DNS — manages <subdomain>.<zone> + *.<subdomain>.<zone> A
+# records pointing at edge-01's public IP. Token comes from
+# CLOUDFLARE_API_TOKEN env var.
+#   enable_dns=true  → CF records created, DNS-01 solver in ClusterIssuer,
+#                      wildcard cert for *.edge.dotunet.com
+#   enable_dns=false → nip.io hostnames, HTTP-01 solver via Cilium Gateway
+enable_dns    = false
+dns_zone      = "example.com"
+dns_subdomain = "svc"
+
+# Pass the API token via the CLOUDFLARE_API_TOKEN env var. The Cloudflare
+# provider reads it natively (same pattern as AWS provider using
+# ~/.aws/credentials). When enable_dns is false, the env var is unused.

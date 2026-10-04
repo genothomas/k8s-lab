@@ -1,0 +1,45 @@
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_private_key_file: ~/.ssh/nexus_nodes
+    ansible_ssh_common_args: '-o ProxyCommand="ssh -W %h:%p -i ~/.ssh/nexus_edge ubuntu@${edge_public_ip}"'
+    cluster_name: "${cluster_name}"
+    kubernetes_environment: "${environment}"
+    edge_public_ip: "${edge_public_ip}"
+    node_01_private_ip: "${node_01_private_ip}"
+    vpc_cidr: "${vpc_cidr}"
+    public_subnet_cidrs: ${jsonencode(public_subnet_cidrs)}
+    private_subnet_cidrs: ${jsonencode(private_subnet_cidrs)}
+    kubernetes_pod_subnet: "${kubernetes_pod_subnet}"
+    kubernetes_service_subnet: "${kubernetes_service_subnet}"
+    enable_dns: ${enable_dns}
+    dns_zone: "${dns_zone}"
+    dns_subdomain: "${dns_subdomain}"
+    nip_apex: "${replace(edge_public_ip, ".", "-")}.nip.io"
+    cert_letsencrypt_email: "${enable_dns ? "ops@${dns_zone}" : "ops@k8s-lab.dev"}"
+
+  children:
+    edge:
+      hosts:
+        edge-01:
+          ansible_host: ${edge_public_ip}
+          ansible_ssh_private_key_file: ~/.ssh/nexus_edge
+          ansible_ssh_common_args: ''
+
+    control_plane:
+      hosts:
+        node-01:
+          ansible_host: ${node_01_private_ip}
+        node-02:
+          ansible_host: ${node_02_private_ip}
+        node-03:
+          ansible_host: ${node_03_private_ip}
+
+    workers:
+      hosts: {}
+
+    kubernetes:
+      children:
+        control_plane:
+        workers:

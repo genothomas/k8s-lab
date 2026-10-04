@@ -1,0 +1,76 @@
+---
+- name: kubeadm init on first control plane
+  hosts: node-01
+  become: true
+  vars:
+    kubeadm_run_init: true
+    kubeadm_run_join: false
+    kubernetes_api_endpoint_host: "{{ kubernetes_api_endpoint.split(':')[0] }}"
+  roles:
+    - role: kubeadm
+
+- name: Install Cilium CNI on first control plane
+  hosts: node-01
+  become: true
+  roles:
+    - role: cni
+
+- name: kubeadm join remaining control planes
+  hosts: node-02,node-03
+  become: true
+  serial: 1
+  vars:
+    kubeadm_run_init: false
+    kubeadm_run_join: true
+    kubernetes_api_endpoint_host: "{{ kubernetes_api_endpoint.split(':')[0] }}"
+  roles:
+    - role: kubeadm
+
+- name: Allow workloads on control-plane nodes (lab topology)
+  hosts: node-01
+  become: true
+  tasks:
+    - name: Remove NoSchedule taint from control-plane nodes
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes
+          --all node-role.kubernetes.io/control-plane:NoSchedule-
+      register: taint_remove
+      changed_when: "'untainted' in taint_remove.stdout"
+      when: not ansible_check_mode
+
+- name: Verify cluster
+  hosts: node-01
+  become: true
+  tasks:
+    - name: Wait for all nodes Ready
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready node --all --timeout=300s
+      register: cluster_wait
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: cluster_wait.rc == 0
+      when: not ansible_check_mode
+
+    - name: Show cluster nodes
+      ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+      register: kubectl_get_nodes
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Print cluster nodes
+      ansible.builtin.debug:
+        var: kubectl_get_nodes.stdout_lines
+      when: not ansible_check_mode
+
+    - name: Show core system pods
+      ansible.builtin.command: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
+      register: kubectl_get_pods
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Print core system pods
+      ansible.builtin.debug:
+        var: kubectl_get_pods.stdout_lines
+      when: not ansible_check_mode

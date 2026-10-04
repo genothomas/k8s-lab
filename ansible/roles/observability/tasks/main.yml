@@ -1,0 +1,190 @@
+---
+- name: Helm + namespace + install
+  when: not ansible_check_mode
+  block:
+    - name: Create monitoring namespace
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} create namespace {{ monitor }}
+          --dry-run=client -o yaml
+          | kubectl --kubeconfig={{ kubeconfig }} apply -f -
+      register: ns_apply
+      changed_when: "'created' in ns_apply.stdout or 'configured' in ns_apply.stdout"
+
+    - name: Add + update VM Helm repos
+      ansible.builtin.shell:
+        cmd: |
+          helm repo add {{ vm_chart_repo }} {{ vm_chart_url }}
+          helm repo update
+      register: repos
+      changed_when: "'has been added' in repos.stdout"
+
+    - name: Render VM overrides
+      ansible.builtin.template:
+        src: vm-overrides.yaml.j2
+        dest: /tmp/vm-overrides.yaml
+        mode: "0644"
+
+    - name: Install victoria-metrics-k8s-stack
+      ansible.builtin.command:
+        cmd: >-
+          helm upgrade --install {{ release }} {{ vm_chart_name }}
+          --version {{ vm_version }}
+          --namespace {{ monitor }}
+          --kubeconfig={{ kubeconfig }}
+          -f /tmp/vm-overrides.yaml
+          --timeout 15m
+      register: vm_install
+      changed_when: "'STATUS: deployed' in vm_install.stdout or 'UPGRADED RELEASE' in vm_install.stdout"
+
+    - name: Apply Alertmanager config Secret
+      ansible.builtin.template:
+        src: alertmanager-config.yaml.j2
+        dest: /tmp/alertmanager-config.yaml
+        mode: "0644"
+
+    - name: Apply Alertmanager config
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/alertmanager-config.yaml
+      register: am_secret_apply
+      changed_when: "'configured' in am_secret_apply.stdout or 'created' in am_secret_apply.stdout"
+
+    # VM chart's config-reloader reads `alertmanager.yaml.gz` (gzipped).
+    # Re-add it as a base64-gzipped copy of our plain key.
+    - name: Add gzipped Alertmanager config key
+      ansible.builtin.shell:
+        cmd: |
+          PLAIN=$(kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} get secret alertmanager-vm-external -o jsonpath='{.data.alertmanager\.yaml}')
+          GZIPPED=$(echo "$PLAIN" | base64 -d | gzip -c | base64 -w0)
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} patch secret alertmanager-vm-external --type=json \
+            -p='[{"op":"add","path":"/data/alertmanager.yaml.gz","value":"'"$GZIPPED"'"}]'
+      args: { executable: /bin/bash }
+      register: am_gz_patch
+      changed_when: "'patched' in am_gz_patch.stdout"
+      retries: 5
+      delay: 10
+      until: am_gz_patch.rc == 0
+
+    - name: Rollout restart Alertmanager
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} rollout restart statefulset/vmalertmanager-{{ release }}
+      changed_when: true
+
+    - name: Wait for VM stack rollouts
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} rollout status {{ item.kind }}/{{ item.name }} --timeout=600s
+      loop:
+        - { kind: deploy, name: "{{ release }}-grafana" }
+        - { kind: deploy, name: "vmsingle-{{ release }}" }
+        - { kind: deploy, name: "vmagent-{{ release }}" }
+        - { kind: deploy, name: "vmalert-{{ release }}" }
+      register: rollouts
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: rollouts.rc == 0
+
+    - name: Wait for Alertmanager pod ready
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} wait --for=condition=ready pod -l app.kubernetes.io/name=vmalertmanager --timeout=600s
+      register: am_rollout
+      changed_when: false
+      retries: 3
+      delay: 10
+      until: am_rollout.rc == 0
+
+- name: Custom rules + scrapes + dashboards
+  when: not ansible_check_mode
+  block:
+    - name: Render + apply custom VMRule
+      ansible.builtin.template:
+        src: custom-rules.yaml.j2
+        dest: /tmp/custom-rules.yaml
+        mode: "0644"
+
+    - name: Apply custom VMRule
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/custom-rules.yaml
+      register: rules_apply
+      changed_when: "'configured' in rules_apply.stdout or 'created' in rules_apply.stdout"
+
+    - name: Render + apply podinfo VMServiceScrape
+      when: enable_demo_metrics_servicemonitor | default(true) | bool
+      block:
+        - name: Render podinfo VMServiceScrape
+          ansible.builtin.template:
+            src: podinfo-servicemonitor.yaml.j2
+            dest: /tmp/podinfo-servicemonitor.yaml
+            mode: "0644"
+
+        - name: Apply podinfo VMServiceScrape
+          ansible.builtin.command:
+            cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/podinfo-servicemonitor.yaml
+          register: sm_apply
+          changed_when: "'configured' in sm_apply.stdout or 'created' in sm_apply.stdout"
+
+    - name: Render cert-manager VMServiceScrape
+      ansible.builtin.template:
+        src: cert-manager-vmservicescrape.yaml.j2
+        dest: /tmp/cert-manager-vmservicescrape.yaml
+        mode: "0644"
+
+    - name: Apply cert-manager VMServiceScrape
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/cert-manager-vmservicescrape.yaml
+      register: cm_sm_apply
+      changed_when: "'configured' in cm_sm_apply.stdout or 'created' in cm_sm_apply.stdout"
+
+    # Grafana dashboards sidecar picks up ConfigMaps with label
+    # `grafana_dashboard=1` in the monitoring namespace.
+    - name: Render cert-manager Grafana dashboard
+      ansible.builtin.template:
+        src: cert-manager-dashboard.yaml.j2
+        dest: /tmp/cert-manager-dashboard.yaml
+        mode: "0644"
+
+    - name: Apply cert-manager Grafana dashboard
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/cert-manager-dashboard.yaml
+      register: cm_dash_apply
+      changed_when: "'configured' in cm_dash_apply.stdout or 'created' in cm_dash_apply.stdout"
+
+    # Grafana shares the web Gateway https listener. web-tls covers
+    # grafana.<apex> via wildcard (DNS mode) or explicit SAN (nip.io).
+    - name: Render Grafana HTTPRoute
+      ansible.builtin.template:
+        src: grafana-httproute.yaml.j2
+        dest: /tmp/grafana-httproute.yaml
+        mode: "0644"
+
+    - name: Apply Grafana HTTPRoute
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} apply -f /tmp/grafana-httproute.yaml
+      register: grafana_route_apply
+      changed_when: "'configured' in grafana_route_apply.stdout or 'created' in grafana_route_apply.stdout"
+
+- name: Verify
+  when: not ansible_check_mode
+  block:
+    - name: Show monitoring pods
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }} get pods -o wide
+      register: mon_pods
+      changed_when: false
+
+    - name: Print monitoring pods
+      ansible.builtin.debug: { var: mon_pods.stdout_lines }
+
+    - name: Grafana local probe
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ monitor }}
+          exec deploy/{{ release }}-grafana --
+          curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login
+      register: grafana_local
+      changed_when: false
+      failed_when: false
+
+    - name: Print Grafana probe
+      ansible.builtin.debug:
+        msg: "Grafana local HTTP status: {{ grafana_local.stdout }}"

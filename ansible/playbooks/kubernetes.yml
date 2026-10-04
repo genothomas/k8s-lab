@@ -1,0 +1,8 @@
+---
+- name: Prepare Kubernetes nodes
+  hosts: kubernetes
+  become: true
+  roles:
+    - kubelet_prereq
+    - containerd
+    - kubernetes

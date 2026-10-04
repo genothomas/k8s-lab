@@ -1,0 +1,34 @@
+---
+- name: Install containerd
+  ansible.builtin.apt:
+    name: "{{ containerd_package }}"
+    state: present
+    update_cache: true
+
+- name: Ensure containerd config directory exists
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: "0755"
+  when: not ansible_check_mode
+
+- name: Generate default containerd config
+  ansible.builtin.command: containerd config default
+  register: containerd_default_config
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Write containerd config with systemd cgroup driver
+  ansible.builtin.copy:
+    dest: /etc/containerd/config.toml
+    mode: "0644"
+    content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+  notify: Restart containerd
+  when: not ansible_check_mode
+
+- name: Enable and start containerd
+  ansible.builtin.service:
+    name: "{{ containerd_package }}"
+    state: started
+    enabled: true
+  when: not ansible_check_mode

@@ -1,0 +1,40 @@
+---
+kubernetes_version: "1.36.5"
+kubernetes_patch_version: "1.36"
+
+container_runtime: containerd
+
+# External API endpoint fronted by HAProxy. Added to apiserver cert SANs.
+kubernetes_api_endpoint: "{{ edge_public_ip }}:6443"
+
+# In-cluster endpoint — private IP of first control plane. Avoids hairpin
+# route edge-01 (NAT) → haproxy → node-01:6443 that times out kubeadm
+# upload-certs ClusterRoleBinding POST (10s).
+kubernetes_control_plane_endpoint: "{{ node_01_private_ip }}:6443"
+
+haproxy_kube_api_port: 6443
+haproxy_http_port: 80
+haproxy_https_port: 443
+haproxy_stats_port: 8404
+
+# Network ranges sourced from terraform via inventory all.vars.
+
+common_packages:
+  - curl
+  - ca-certificates
+  - gnupg
+  - apt-transport-https
+  - chrony
+  - software-properties-common
+
+kubernetes_sysctl:
+  net.ipv4.ip_forward: 1
+  net.bridge.bridge-nf-call-iptables: 1
+  net.bridge.bridge-nf-call-ip6tables: 1
+
+kubernetes_kernel_modules:
+  - overlay
+  - br_netfilter
+
+# ntfy topic includes env + name so dev/staging/prod route to own channels.
+alertmanager_webhook_url: "https://ntfy.sh/{{ kubernetes_environment }}-{{ cluster_name }}"

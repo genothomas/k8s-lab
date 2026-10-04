@@ -1,0 +1,11 @@
+---
+# Image repository override (e.g. for air-gapped or private registry).
+# Default pulls from registry.k8s.io.
+kubeadm_image_repo: registry.k8s.io
+
+# Extra SANs for the API server cert beyond the haproxy VIP + localhost.
+# Useful when accessing the API via additional DNS names or IPs.
+kubeadm_extra_cert_sans: []
+
+# Disable kube-proxy addon during init so Cilium can replace it.
+kubeadm_skip_kube_proxy: true

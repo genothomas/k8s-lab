@@ -1,0 +1,54 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    maxconn 2000
+    daemon
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+# ---- Kubernetes API server (TCP 6443) ----
+frontend k8s-api
+    bind *:{{ haproxy_kube_api_port }}
+    default_backend k8s-api
+
+backend k8s-api
+    balance roundrobin
+{% for host in groups['control_plane'] %}
+    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_kube_api_port }} check
+{% endfor %}
+
+# ---- HTTP (TCP 80) — passed to Envoy Gateway ----
+frontend k8s-http
+    bind *:{{ haproxy_http_port }}
+    default_backend k8s-http
+
+backend k8s-http
+    balance roundrobin
+{% for host in groups['control_plane'] %}
+    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_http_port }} check
+{% endfor %}
+
+# ---- HTTPS (TCP 443) — passed to Envoy Gateway ----
+frontend k8s-https
+    bind *:{{ haproxy_https_port }}
+    default_backend k8s-https
+
+backend k8s-https
+    balance roundrobin
+{% for host in groups['control_plane'] %}
+    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_https_port }} check
+{% endfor %}
+
+# ---- Stats dashboard (optional) ----
+frontend stats
+    bind *:{{ haproxy_stats_port }}
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 10s

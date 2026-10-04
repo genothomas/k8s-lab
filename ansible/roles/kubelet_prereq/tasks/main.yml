@@ -1,0 +1,31 @@
+---
+- name: Disable swap (kubelet requirement)
+  ansible.builtin.shell: |
+    swapoff -a
+    sed -ri '/\sswap\s/s/^#?.*/#&/' /etc/fstab
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Load required kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ kubernetes_kernel_modules }}"
+
+- name: Persist kernel modules across reboots
+  ansible.builtin.copy:
+    dest: "/etc/modules-load.d/k8s.conf"
+    mode: "0644"
+    content: |
+      {% for mod in kubernetes_kernel_modules %}
+      {{ mod }}
+      {% endfor %}
+
+- name: Apply sysctl settings
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_set: true
+    reload: true
+  loop: "{{ kubernetes_sysctl | dict2items }}"

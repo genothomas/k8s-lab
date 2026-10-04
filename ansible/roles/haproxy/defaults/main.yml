@@ -1,0 +1,7 @@
+---
+haproxy_package: haproxy
+haproxy_kube_api_port: 6443
+haproxy_http_port: 80
+haproxy_https_port: 443
+haproxy_stats_port: 8404
+haproxy_config_path: /etc/haproxy/haproxy.cfg

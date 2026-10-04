@@ -1,0 +1,61 @@
+---
+# HAProxy 3.2 LTS from community PPA (vbernat). Ubuntu 24.04 ships
+# 2.8.x LTS (EOL 2028 Q2); upstream 3.2 branch is LTS until 2030 Q2.
+# vbernat PPA is the de-facto upstream-equivalent for Ubuntu (the
+# haproxy.debian.net repo only carries Debian, no noble directory).
+# Lab config uses TCP mode + simple frontends — no breaking changes
+# between 2.8 → 3.2.
+
+- name: Remove any stale haproxy.debian.net repo from prior attempts
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/haproxy.list
+    - /etc/apt/keyrings/haproxy-archive-keyring.gpg
+
+# Launchpad PPA key for vbernat/haproxy-3.2. Fetched once and
+# referenced by signed_by on the deb822 source. Keyserver.ubuntu.com
+# returns raw ASCII-armored key when op=get is set.
+- name: Fetch vbernat haproxy-3.2 PPA signing key
+  ansible.builtin.get_url:
+    url: https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x3D653970FBAB0A890E4E4E9A0F14D8B0CF4EFE96
+    dest: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
+    mode: "0644"
+    owner: root
+    group: root
+
+- name: Add vbernat haproxy-3.2 PPA (deb822)
+  ansible.builtin.deb822_repository:
+    name: vbernat-haproxy-3-2
+    types: [deb]
+    uris: https://ppa.launchpadcontent.net/vbernat/haproxy-3.2/ubuntu
+    suites: [noble]
+    components: [main]
+    signed_by: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
+    state: present
+
+- name: Install haproxy (pinned to 3.2.x)
+  ansible.builtin.apt:
+    name: "haproxy=3.2.*"
+    state: present
+    update_cache: true
+
+- name: Hold haproxy version
+  ansible.builtin.dpkg_selections:
+    name: haproxy
+    selection: hold
+
+- name: Enable haproxy
+  ansible.builtin.service:
+    name: "{{ haproxy_package }}"
+    enabled: true
+  when: not ansible_check_mode
+
+- name: Deploy haproxy.cfg from template
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: "{{ haproxy_config_path }}"
+    mode: "0644"
+    validate: "haproxy -c -f %s"
+  notify: Restart haproxy

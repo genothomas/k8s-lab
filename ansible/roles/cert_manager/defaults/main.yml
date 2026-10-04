@@ -1,0 +1,16 @@
+---
+cert_manager_version: "v1.21.2"
+cert_manager_namespace: cert-manager
+cert_manager_chart_repo: jetstack
+cert_manager_chart_name: jetstack/cert-manager
+cert_manager_chart_url: https://charts.jetstack.io
+
+# Staging has higher rate limits but issues untrusted certs. Use staging
+# for first run, switch to prod after verifying the plumbing works.
+cert_manager_letsencrypt_server: https://acme-v02.api.letsencrypt.org/directory
+# cert_manager_letsencrypt_server: https://acme-staging-v02.api.letsencrypt.org/directory
+
+# Email rendered into the ClusterIssuer acme.email field. Sourced from
+# inventory `cert_letsencrypt_email`. LE rejects example.com, so the
+# inventory defaults to ops@k8s-lab.dev (enable_dns=false) or
+# ops@${dns_zone} (enable_dns=true).
