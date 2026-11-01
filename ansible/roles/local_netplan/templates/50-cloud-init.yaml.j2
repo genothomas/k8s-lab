@@ -1,0 +1,18 @@
+network:
+  version: 2
+  ethernets:
+    {{ local_netplan_interface }}:
+      dhcp-identifier: "{{ local_netplan_dhcp_identifier }}"
+      dhcp4: {{ local_netplan_dhcp4 | lower }}
+      dhcp4-overrides:
+        use-routes: {{ local_netplan_use_routes | lower }}
+        use-domains: {{ local_netplan_use_domains | lower }}
+      dhcp6: {{ local_netplan_dhcp6 | lower }}
+      accept-ra: {{ local_netplan_accept_ra | lower }}
+      link-local:
+        - ipv4
+{% if local_netplan_default_route %}
+      routes:
+        - to: default
+          via: {{ local_netplan_default_gateway }}
+{% endif %}

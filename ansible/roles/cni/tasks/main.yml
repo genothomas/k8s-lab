@@ -51,14 +51,14 @@
       --set hubble.enabled={{ cilium_hubble_enabled }}
       --set gatewayAPI.enabled={{ cilium_gateway_api_enabled }}
       -f /tmp/cilium-overrides.yaml
-      --wait --timeout 10m
+      --wait --timeout {{ cilium_install_timeout }}
   register: cilium_install
   changed_when: "'STATUS: deployed' in cilium_install.stdout"
   when: not ansible_check_mode
 
 - name: Wait for Cilium DaemonSet to be Ready
   ansible.builtin.command:
-    cmd: kubectl -n {{ cilium_namespace }} rollout status ds/{{ cilium_chart_repo }} --kubeconfig=/etc/kubernetes/admin.conf --timeout=300s
+    cmd: kubectl -n {{ cilium_namespace }} rollout status ds/{{ cilium_chart_repo }} --kubeconfig=/etc/kubernetes/admin.conf --timeout={{ cilium_rollout_timeout }}
   register: cilium_rollout
   changed_when: false
   when: not ansible_check_mode

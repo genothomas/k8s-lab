@@ -6,11 +6,19 @@ ANS     := ansible-playbook -i $(ANS_INV)
 PING    := ansible -i $(ANS_INV) all -m ping
 TF      := terraform -chdir=terraform
 
+# Local-VM lab: hand-maintained inventory, no Terraform, no AWS.
+# These targets never depend on `inventory` — that target pipes terraform
+# output into $(ANS_INV) and would overwrite local.yml.
+LOCAL_INV  := ansible/inventory/local.yml
+LOCAL_ANS  := ansible-playbook -i $(LOCAL_INV)
+LOCAL_PING := ansible -i $(LOCAL_INV) all -m ping
+
 # Wait time for hosts after terraform apply / reboot. Override cmdline.
 WAIT_TIMEOUT  ?= 360
 WAIT_INTERVAL ?= 10
 
-.PHONY: all help check ping terraform inventory bootstrap k8s cni gateway cert observability demo haproxy clean destroy nuke wait-ready test
+.PHONY: all help check ping terraform inventory bootstrap k8s cni gateway cert observability demo haproxy clean destroy nuke wait-ready test \
+        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo local-test local-cleanup local-all
 
 .DEFAULT_GOAL := check
 
@@ -105,6 +113,86 @@ test:
 			--resolve "$${h}.$${apex}:443:$${edge_ip}"; \
 	done
 
+# ---------------------------------------------------------------------------
+# Local-VM lab (192.168.16.0/26 LAN: edge-01 + 3 control planes).
+# Static inventory, no Terraform. Nodes are reachable only through the edge
+# bastion (ProxyCommand lives in the inventory).
+# ---------------------------------------------------------------------------
+
+local-check:
+	@if [ ! -f $(LOCAL_INV) ]; then echo "ERROR: $(LOCAL_INV) missing."; exit 1; fi
+	@start=$$(date +%s); \
+	while :; do \
+		if $(LOCAL_PING) >/dev/null 2>&1; then \
+			echo ""; \
+			echo "All local hosts reachable after $$(($$(date +%s) - start))s."; \
+			$(LOCAL_PING); \
+			exit 0; \
+		fi; \
+		now=$$(date +%s); \
+		if [ $$((now - start)) -ge $(WAIT_TIMEOUT) ]; then \
+			echo ""; \
+			echo "FAIL: local hosts not reachable after $(WAIT_TIMEOUT)s."; \
+			$(LOCAL_PING); \
+			exit 1; \
+		fi; \
+		printf "."; \
+		sleep $(WAIT_INTERVAL); \
+	done
+
+local-prep: local-check
+	$(LOCAL_ANS) ansible/playbooks/local-prep.yml
+
+local-bootstrap: local-check
+	$(LOCAL_ANS) ansible/playbooks/bootstrap.yml
+
+local-haproxy: local-check
+	$(LOCAL_ANS) ansible/playbooks/haproxy.yml
+
+local-k8s: local-check
+	$(LOCAL_ANS) ansible/playbooks/kubernetes.yml
+
+local-cluster: local-check
+	$(LOCAL_ANS) ansible/playbooks/cluster.yml
+
+local-gateway: local-check
+	$(LOCAL_ANS) ansible/playbooks/cluster-gateway.yml
+
+# DNS-01 via Cloudflare: needs a real zone in the inventory AND the token
+# in the environment. The token is written straight into a cert-manager
+# Secret — it is never stored in the repo.
+local-cert: local-check
+	@if grep -q '^    enable_dns: true' $(LOCAL_INV) 2>/dev/null; then \
+		if grep -q '^    dns_zone: "REPLACE_WITH_REAL_ZONE"' $(LOCAL_INV); then \
+			echo "ERROR: dns_zone is still the placeholder in $(LOCAL_INV)."; \
+			echo "Set a real Cloudflare-managed zone before running the cert phase."; \
+			exit 1; \
+		fi; \
+		if [ -z "$$CLOUDFLARE_API_TOKEN" ]; then \
+			echo "ERROR: enable_dns=true but CLOUDFLARE_API_TOKEN unset."; \
+			echo "Export it (scope Zone:DNS:Edit) or flip enable_dns=false in $(LOCAL_INV)."; \
+			exit 1; \
+		fi; \
+	fi
+	$(LOCAL_ANS) ansible/playbooks/cluster-cert.yml
+
+local-observability: local-check
+	$(LOCAL_ANS) ansible/playbooks/cluster-observability.yml
+
+local-demo: local-check
+	$(LOCAL_ANS) ansible/playbooks/cluster-demo.yml
+
+local-test:
+	@$(MAKE) ANS_INV=$(LOCAL_INV) test
+
+# Trim scratch files, shell history, apt cache and journal on all four VMs
+# so they can be snapshotted.
+local-cleanup: local-check
+	$(LOCAL_ANS) ansible/playbooks/cleanup.yml
+
+local-all: local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo
+	@$(MAKE) local-test
+
 clean:
 	ansible -i $(ANS_INV) control_plane -m command \
 	  -a 'kubectl --kubeconfig=/etc/kubernetes/admin.conf delete namespace demo monitoring --ignore-not-found' \
@@ -138,6 +226,21 @@ help:
 	@echo "  nuke          - terraform destroy + sweep AWS for nexus-* orphans"
 	@echo "  test          - HTTP GET probes against grafana/pod/demo via edge-01"
 	@echo ""
+	@echo "Local-VM lab (static inventory, no Terraform):"
+	@echo "  local-check         - ping all local hosts with retry"
+	@echo "  local-prep          - local-prep.yml (netplan: no DHCP search domain, route via edge)"
+	@echo "  local-bootstrap     - bootstrap.yml against local.yml"
+	@echo "  local-haproxy       - haproxy.yml (HAProxy on edge-01)"
+	@echo "  local-k8s           - kubernetes.yml (containerd + kubelet)"
+	@echo "  local-cluster       - cluster.yml (kubeadm init, Cilium, joins)"
+	@echo "  local-gateway       - cluster-gateway.yml (Gateway API + web Gateway)"
+	@echo "  local-cert          - cluster-cert.yml (cert-manager + LE, needs CLOUDFLARE_API_TOKEN)"
+	@echo "  local-observability - cluster-observability.yml (VictoriaMetrics stack)"
+	@echo "  local-demo          - cluster-demo.yml (podinfo demo)"
+	@echo "  local-test          - HTTP GET probes via edge-01 (local inventory)"
+	@echo "  local-cleanup       - cleanup.yml (scratch files, history, apt cache, journal)"
+	@echo "  local-all           - full local pipeline"
+	@echo ""
 	@echo "Tunables (env or cmdline):"
 	@echo "  WAIT_TIMEOUT   max seconds to wait for hosts (default 360)"
 	@echo "  WAIT_INTERVAL  seconds between ping attempts (default 10)"
@@ -148,3 +251,4 @@ help:
 	@echo "  make bootstrap k8s cni               # bring up k8s"
 	@echo "  make observability demo              # install apps"
 	@echo "  make all                             # end-to-end rebuild"
+	@echo "  make local-k8s local-cluster          # bring up the local-VM cluster"

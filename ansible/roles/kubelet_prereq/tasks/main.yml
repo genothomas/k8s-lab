@@ -29,3 +29,11 @@
     sysctl_set: true
     reload: true
   loop: "{{ kubernetes_sysctl | dict2items }}"
+
+- name: Resolve the node name to its LAN IP
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "{{ ansible_host }} {{ inventory_hostname }}"
+    regexp: '^[0-9.]+\s+{{ inventory_hostname }}(\s|$)'
+    state: present
+    insertafter: EOF

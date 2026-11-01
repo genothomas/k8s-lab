@@ -1,0 +1,83 @@
+---
+# Static inventory for the local-VM lab. Terraform-free — edit by hand.
+#
+# Topology (flat LAN 192.168.16.0/26):
+#
+#   edge-01  192.168.16.30   NAT gateway + HAProxy + SSH bastion
+#   node-01  192.168.16.25   control plane (kubeadm init target)
+#   node-02  192.168.16.26   control plane
+#   node-03  192.168.16.27   control plane
+#
+# The nodes are reachable from the workstation only through the edge
+# bastion, hence the ProxyCommand below. edge-01 is directly reachable
+# and overrides it back to ''.
+#
+# The VM hostnames stay as provisioned (master, node1, node2). kubeadm
+# passes --hostname-override to the kubelet whenever --node-name differs
+# from the OS hostname, so the Node objects are named node-01/02/03 to
+# match the inventory keys while the VMs keep their original names.
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_private_key_file: ~/.ssh/nexus_nodes
+    ansible_ssh_common_args: '-o ProxyCommand="ssh -W %h:%p -i ~/.ssh/nexus_edge ubuntu@192.168.16.30"'
+
+    cluster_name: "nexus"
+    kubernetes_environment: "dev"
+
+    edge_public_ip: "192.168.16.30"
+    node_01_private_ip: "192.168.16.25"
+    node_02_private_ip: "192.168.16.26"
+    node_03_private_ip: "192.168.16.27"
+
+    vpc_cidr: "192.168.16.0/26"
+    public_subnet_cidrs: ["192.168.16.0/26"]
+    private_subnet_cidrs: ["192.168.16.0/26"]
+
+    kubernetes_pod_subnet: "10.42.0.0/16"
+    kubernetes_service_subnet: "10.43.0.0/16"
+
+    # DNS-01 via Cloudflare. Replace dns_zone with the real zone before
+    # running the cert phase; the Makefile guard refuses to run it
+    # against the placeholder.
+    enable_dns: true
+    dns_zone: "REPLACE_WITH_REAL_ZONE"
+    dns_subdomain: "svc"
+    # Public IP of the remote VPS — the address the internet sees.
+    nip_apex: "152-67-31-10.nip.io"
+    cert_letsencrypt_email: "ops@REPLACE_WITH_REAL_ZONE"
+
+    # The edge NAT path is hand-built (WireGuard + policy routing); the
+    # AWS-flavoured nat role would MASQUERADE the wrong subnet and bake
+    # live tunnel rules into rules.v4. Keep it off.
+    edge_enable_nat: false
+
+    # SANs for the apiserver cert beyond the edge HAProxy address:
+    # the public VPS address and the edge WireGuard address.
+    kubeadm_extra_cert_sans: ["152.67.31.10", "10.8.0.2"]
+
+  children:
+    edge:
+      hosts:
+        edge-01:
+          ansible_host: "192.168.16.30"
+          ansible_ssh_private_key_file: ~/.ssh/nexus_edge
+          ansible_ssh_common_args: ''
+
+    control_plane:
+      hosts:
+        node-01:
+          ansible_host: "192.168.16.25"
+        node-02:
+          ansible_host: "192.168.16.26"
+        node-03:
+          ansible_host: "192.168.16.27"
+
+    workers:
+      hosts: {}
+
+    kubernetes:
+      children:
+        control_plane:
+        workers:

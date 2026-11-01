@@ -8,7 +8,9 @@
       --service-cidr={{ kubernetes_service_subnet }}
       --upload-certs
       --node-name={{ inventory_hostname }}
-      --apiserver-cert-extra-sans={{ kubernetes_api_endpoint_host }}
+      --kubernetes-version={{ kubeadm_kubernetes_version }}
+      --apiserver-cert-extra-sans={{ ([kubernetes_api_endpoint_host] + kubeadm_extra_cert_sans) | join(',') }}
+      --ignore-preflight-errors={{ kubeadm_ignore_preflight_errors }}
       {% if kubeadm_skip_kube_proxy %}--skip-phases=addon/kube-proxy{% endif %}
     creates: /etc/kubernetes/admin.conf
   register: kubeadm_init_result
@@ -18,12 +20,14 @@
   ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
   register: kubeadm_upload_certs
   changed_when: false
+  no_log: "{{ kubeadm_debug | bool }}"
   when: kubeadm_run_init | default(false) and not ansible_check_mode
 
 - name: Get join command (used by both control-plane join and worker join)
   ansible.builtin.command: kubeadm token create --print-join-command
   register: kubeadm_join_command
   changed_when: false
+  no_log: "{{ kubeadm_debug | bool }}"
   when: kubeadm_run_init | default(false) and not ansible_check_mode
 
 - name: Ensure kube config directory exists
@@ -52,8 +56,10 @@
       --control-plane
       --certificate-key {{ hostvars[groups['control_plane'][0]]['kubeadm_upload_certs'].stdout_lines[-1] }}
       --node-name={{ inventory_hostname }}
+      --ignore-preflight-errors={{ kubeadm_ignore_preflight_errors }}
     creates: /etc/kubernetes/kubelet.conf
   register: kubeadm_join_result
+  no_log: "{{ kubeadm_debug | bool }}"
   when: kubeadm_run_join | default(false) and not ansible_check_mode
 
 - name: Install kubeconfig for ubuntu user (joiner)

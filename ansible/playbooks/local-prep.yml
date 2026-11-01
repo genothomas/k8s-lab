@@ -1,0 +1,15 @@
+---
+# Node preparation for the local-VM lab.
+#
+# Manages the netplan config on the Kubernetes nodes: suppresses the DHCP
+# search domain (which hijacks in-cluster pod DNS) and pins a persistent
+# default route via the edge gateway.
+#
+# Run BEFORE `local-k8s` / `local-cluster` on a fresh build. Re-running it
+# on a live cluster is safe — the generated config is identical, so nothing
+# changes.
+- name: Prepare local-VM nodes
+  hosts: kubernetes
+  become: true
+  roles:
+    - local_netplan

@@ -9,3 +9,17 @@ kubeadm_extra_cert_sans: []
 
 # Disable kube-proxy addon during init so Cilium can replace it.
 kubeadm_skip_kube_proxy: true
+
+# Preflight checks to ignore. kubeadm demands >= 2 CPUs; the local-VM lab
+# nodes have 1 vCPU each. Comma-separated list of kubeadm check names.
+kubeadm_ignore_preflight_errors: "NumCPU"
+
+# Pin the control-plane version to the installed kubelet/kubeadm version.
+# Without this, kubeadm queries the upstream stable channel and pulls a
+# different patch than the kubelet binary that is actually on the node.
+kubeadm_kubernetes_version: "{{ kubernetes_version }}"
+
+# The bootstrap token and the upload-certs key are cluster-admin
+# credentials. They are masked from ansible output by default; flip this
+# to true only when debugging a failing join.
+kubeadm_debug: false

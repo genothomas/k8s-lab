@@ -12,6 +12,11 @@
 - name: Install Cilium CNI on first control plane
   hosts: node-01
   become: true
+  vars:
+    # Gateway API CRDs do not exist yet on a fresh cluster — cilium-operator
+    # reads them only at pod start. cluster-gateway.yml installs the CRDs
+    # and flips this on in one place.
+    cilium_gateway_api_enabled: false
   roles:
     - role: cni
 

@@ -1,0 +1,123 @@
+---
+# Clean a lab host so it can be snapshotted.
+#
+# Removes operator scratch files, shell history and editor state, Ansible
+# remote-temp residue and package-manager caches. Deliberately does NOT touch
+# cluster state (/var/lib/etcd, /var/lib/containerd, /etc/kubernetes) — a
+# snapshot is meant to restore a working cluster.
+#
+# Note: /tmp is swept LAST. Ansible writes its own module payload files
+# (ansible_ansible.legacy.*) into the remote temp dir on every command task,
+# so sweeping /tmp before the command tasks only relocates the litter.
+- name: Cleanup host for snapshot
+  hosts: all
+  become: true
+  vars:
+    # Operator scratch files. X11/ICE/font sockets and tmux server sockets are
+    # live and are left alone.
+    cleanup_tmp_patterns:
+      - "*.sh"
+      - "*.yaml"
+      - "*.yml"
+      - "*.pl"
+      - "*.txt"
+      - "ansible_ansible.legacy.*"
+
+    # Editor / pager state.
+    cleanup_editor_state:
+      - /root/.viminfo
+      - /root/.lesshst
+      - /home/ubuntu/.viminfo
+      - /home/ubuntu/.lesshst
+
+    # Shell history — truncated in place so ownership and mode survive.
+    cleanup_history_files:
+      - /root/.bash_history
+      - /root/.zsh_history
+      - /home/ubuntu/.bash_history
+      - /home/ubuntu/.zsh_history
+
+    # Ansible remote-temp residue from interrupted runs.
+    cleanup_ansible_tmp:
+      - /root/.ansible/tmp
+      - /home/ubuntu/.ansible/tmp
+
+    # Journal cap for the snapshot. Recent logs are retained for debugging.
+    cleanup_journal_max_size: 20M
+
+    # Purge /var/lib/apt/lists (~205 MB of package indexes). Off by default:
+    # the lab's uplink is slow, and `apt-get update` costs a round trip.
+    cleanup_purge_apt_lists: false
+
+  tasks:
+    - name: Remove editor and pager state
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ cleanup_editor_state }}"
+      when: not ansible_check_mode
+
+    - name: Truncate shell history
+      ansible.builtin.command:
+        cmd: truncate -s 0 {{ item }}
+      loop: "{{ cleanup_history_files }}"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Remove Ansible remote-temp residue
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ cleanup_ansible_tmp }}"
+      when: not ansible_check_mode
+
+    - name: Clear apt package cache
+      ansible.builtin.apt:
+        clean: true
+        autoclean: true
+      when: not ansible_check_mode
+
+    - name: Purge apt package indexes
+      ansible.builtin.apt:
+        update_cache: false
+      when:
+        - cleanup_purge_apt_lists
+        - not ansible_check_mode
+
+    - name: Vacuum systemd journal
+      ansible.builtin.command:
+        cmd: journalctl --vacuum-size={{ cleanup_journal_max_size }}
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Report disk usage after cleanup
+      ansible.builtin.command:
+        cmd: df -h /
+      register: cleanup_df
+      changed_when: false
+
+    - name: Print disk usage
+      ansible.builtin.debug:
+        var: cleanup_df.stdout_lines
+
+    # The /tmp sweep is LAST on purpose: Ansible writes a module payload
+    # file (ansible_ansible.legacy.command_payload_*) into the remote temp
+    # dir for every command/shell task, so any sweep before the final
+    # command task just relocates the litter. This one has to run after
+    # every other task to be effective.
+    - name: Find operator scratch files in /tmp
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "{{ cleanup_tmp_patterns }}"
+        file_type: file
+        hidden: true
+      register: cleanup_tmp_files
+
+    - name: Remove operator scratch files from /tmp
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ cleanup_tmp_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: not ansible_check_mode

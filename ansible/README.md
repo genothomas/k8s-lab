@@ -10,6 +10,7 @@ Ansible owns node configuration and cluster bootstrap.
 - `haproxy` — external L4 load balancer for the kube API and HTTP(S) traffic to nodes.
 - `kubeadm` — `kubeadm init` on first control plane + `kubeadm join` on remaining control planes; captures upload-certs key + join command for downstream nodes.
 - `cni` — Cilium install via Helm (replaces kube-proxy).
+- `local_netplan` — node-side netplan config for the local-VM lab: suppresses the DHCP search domain (`use-domains: false`) so pod DNS is not hijacked, and pins a persistent default route via the edge gateway.
 
 ## Playbooks
 
@@ -23,6 +24,8 @@ Ansible owns node configuration and cluster bootstrap.
 | `cluster-cert.yml` | node-01 | cert-manager (Helm) + ClusterIssuer + Certificate (`enable_dns=true` → DNS-01/Cloudflare, else HTTP-01) |
 | `cluster-observability.yml` | node-01 | VictoriaMetrics stack via `victoria-metrics-k8s-stack` + `vm-overrides.yaml` |
 | `cluster-demo.yml` | node-01 | `podinfo` Deployment/Service/HTTPRoute in `demo` namespace |
+| `local-prep.yml` | kubernetes | local_netplan (no DHCP search domain, default route via edge) |
+| `cleanup.yml` | all hosts | scratch files, shell history, apt cache, journal — for snapshotting |
 
 Driven end-to-end by the top-level `Makefile`. See `make help`.
 
@@ -34,7 +37,52 @@ Driven end-to-end by the top-level `Makefile`. See `make help`.
 terraform -chdir=../terraform output -raw ansible_inventory_yaml > inventory/hosts.yml
 ```
 
+`inventory/local.yml` is the hand-maintained inventory for the **local-VM lab**
+(no Terraform). It encodes the same var names, so `group_vars/all.yml` resolves
+unchanged. Never regenerate it — the `make inventory` target writes to
+`inventory/hosts.yml`, but the `local-*` Makefile targets deliberately do not
+depend on it.
+
 The ProxyCommand uses the bastion (edge-01) — make sure `~/.ssh/nexus_edge` is loaded into ssh-agent, or that your `~/.ssh/config` maps `edge-01` to that key.
+
+Local-lab notes:
+
+- Nodes are reachable only through the edge bastion. `all.vars` carries the
+  ProxyCommand; `edge-01` overrides it back to `''` because it is directly
+  reachable.
+- `edge_enable_nat: false` — the edge's WireGuard + policy-routing path is
+  hand-built. The AWS-flavoured `nat` role would MASQUERADE the wrong subnet
+  and run `netfilter-persistent save`, baking live tunnel rules into
+  `rules.v4`.
+- The VMs keep their provisioned hostnames (`master`, `node1`, `node2`).
+  `kubeadm --node-name` makes kubeadm pass `--hostname-override` to the
+  kubelet, so the Node objects are named `node-01/02/03` while the VMs keep
+  their original names.
+- `kubelet_prereq` adds an `/etc/hosts` line mapping the inventory name to
+  the node's LAN IP, which clears kubeadm's hostname preflight.
+- `local_netplan` must run before the cluster comes up (`make local-prep`).
+  The LAN DHCP server hands out the search domain `0x40.net`, and kubelet
+  copies the host's search domains into every pod's `/etc/resolv.conf` with
+  `options ndots:5`. A 3-dot name like `svc.ns.svc.cluster.local` then
+  search-expands to `...cluster.local.0x40.net`, which the LAN DNS wildcard
+  answers with the wrong IP. netplan's `dhcp4-overrides.use-domains: false`
+  emits `UseDomains=false` into the generated systemd-networkd unit, which
+  drops the search domain while leaving the DHCP DNS *server* in place
+  (`use-dns` and `use-domains` are independent knobs). DNS servers are
+  intentionally not pinned — they come from the upstream DHCP lease.
+
+### Snapshot cleanup
+
+`cleanup.yml` trims all four VMs so they can be snapshotted: operator
+scratch files in `/tmp`, shell history, editor/pager state, Ansible
+remote-temp residue, the apt package cache and the systemd journal. It
+deliberately leaves cluster state (`/var/lib/etcd`, `/var/lib/containerd`,
+`/etc/kubernetes`) and the edge's WireGuard keys alone — a snapshot is
+meant to restore a working cluster.
+
+The `/tmp` sweep runs last on purpose: Ansible writes a module payload file
+into the remote temp dir for every command/shell task, so a sweep placed
+before the final command task only relocates the litter.
 
 ## Group vars
 
@@ -77,6 +125,26 @@ ansible-playbook playbooks/cluster-demo.yml
 ```
 
 After step 4, `kubectl get nodes` from node-01 should show all three control planes `Ready`, with `cilium-*` pods running in `kube-system`.
+
+### Local-VM lab
+
+Same playbooks, static inventory, no Terraform:
+
+```bash
+make local-prep          # netplan: no DHCP search domain, route via edge-01
+make local-bootstrap      # common role on edge + nodes
+make local-k8s           # containerd + kubelet/kubeadm/kubectl
+make local-cluster       # kubeadm init + Cilium + control-plane joins
+make local-gateway       # Gateway API CRDs + web Gateway
+make local-cert          # cert-manager + LE (needs CLOUDFLARE_API_TOKEN)
+make local-observability # VictoriaMetrics stack
+make local-demo          # podinfo demo
+make local-test          # HTTP probes through edge-01
+make local-cleanup       # trim scratch/history/caches before snapshotting
+```
+
+`local-all` chains all of them. These targets never touch Terraform and never
+regenerate `inventory/local.yml`.
 
 ## Re-running `cluster.yml`
 

@@ -1,0 +1,44 @@
+---
+# Node-side netplan configuration for the local-VM lab.
+#
+# Two things are managed here:
+#
+#  1. The DHCP search domain is suppressed (`dhcp4-overrides.use-domains:
+#     false` → `UseDomains=false` in the generated systemd-networkd unit).
+#     kubelet appends the host's search domains to every pod's
+#     /etc/resolv.conf and hardcodes `options ndots:5`. A LAN DHCP search
+#     domain such as `0x40.net` makes `svc.ns.svc.cluster.local` (3 dots)
+#     search-expand to `...cluster.local.0x40.net`, which the LAN DNS
+#     wildcard answers with the wrong IP. Dropping the search domain makes
+#     the absolute lookup win.
+#
+#  2. A persistent default route via the edge gateway, because the LAN DHCP
+#     server does not push one.
+#
+# DNS servers are intentionally NOT pinned here — they come from the upstream
+# DHCP lease. `use-dns` and `use-domains` are independent knobs: `use-dns`
+# controls the DHCP-provided DNS *server*, `use-domains` the DHCP-provided
+# search *domains*.
+
+# Primary interface. Empty = autodetect via ansible_default_ipv4.
+local_netplan_interface: ""
+
+# Default route via the edge NAT gateway.
+local_netplan_default_gateway: "192.168.16.30"
+local_netplan_default_route: true
+
+# Target file. 50-cloud-init.yaml is the Ubuntu 24.04 cloud-init default.
+local_netplan_config_path: /etc/netplan/50-cloud-init.yaml
+local_netplan_config_mode: "0600"
+
+# DHCP behaviour.
+local_netplan_dhcp4: true
+local_netplan_dhcp6: false
+local_netplan_accept_ra: false
+local_netplan_use_routes: false
+local_netplan_use_domains: false
+local_netplan_dhcp_identifier: "mac"
+
+# Restart kubelet after applying so existing pods pick up the new
+# resolv.conf. Safe to skip on a host that has no kubelet yet.
+local_netplan_restart_kubelet: true

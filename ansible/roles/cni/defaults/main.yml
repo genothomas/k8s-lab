@@ -20,6 +20,13 @@ cilium_hubble_enabled: true
 # conflicts with the Gateway listener.
 cilium_gateway_api_enabled: true
 
+# Helm --wait budget for the Cilium install. Image pulls on small lab nodes
+# (1 vCPU) over a WireGuard uplink are slow; 10m is tight.
+cilium_install_timeout: 20m
+
+# kubectl rollout status budget for the Cilium DaemonSet.
+cilium_rollout_timeout: 600s
+
 # API server address cilium uses directly, bypassing in-cluster DNS
 # (coredns isn't up at install time — chicken-and-egg with no CNI).
 # Override only if your control-plane topology differs.

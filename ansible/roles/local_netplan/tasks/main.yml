@@ -1,0 +1,97 @@
+---
+- name: Determine primary interface
+  ansible.builtin.set_fact:
+    local_netplan_interface: "{{ local_netplan_interface | default('', true) | default(ansible_default_ipv4.interface, true) }}"
+  when: local_netplan_interface | length == 0
+
+- name: Fail if no primary interface could be determined
+  ansible.builtin.fail:
+    msg: >-
+      Could not determine the primary IPv4 interface. Set
+      local_netplan_interface in the inventory or group vars.
+  when: local_netplan_interface | length == 0
+
+- name: Check whether kubelet is installed
+  ansible.builtin.stat:
+    path: /usr/bin/kubelet
+  register: local_netplan_kubelet_binary
+
+- name: Show netplan target
+  ansible.builtin.debug:
+    msg: >-
+      {{ local_netplan_config_path }}
+      iface={{ local_netplan_interface }}
+      gateway={{ local_netplan_default_gateway }}
+      use-domains={{ local_netplan_use_domains }}
+
+- name: Write netplan configuration
+  ansible.builtin.template:
+    src: 50-cloud-init.yaml.j2
+    dest: "{{ local_netplan_config_path }}"
+    owner: root
+    group: root
+    mode: "{{ local_netplan_config_mode }}"
+  register: local_netplan_written
+  when: not ansible_check_mode
+
+- name: Validate netplan configuration
+  ansible.builtin.command:
+    cmd: netplan generate
+  register: local_netplan_generate
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Apply netplan configuration
+  ansible.builtin.command:
+    cmd: netplan apply
+  register: local_netplan_apply
+  changed_when: local_netplan_written is changed
+  when: not ansible_check_mode
+
+- name: Wait for the link to come back up
+  ansible.builtin.pause:
+    seconds: 5
+  when:
+    - not ansible_check_mode
+    - local_netplan_written is changed
+
+- name: Restart kubelet to pick up the new resolv.conf
+  ansible.builtin.systemd:
+    name: kubelet
+    state: restarted
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - local_netplan_restart_kubelet | bool
+    - local_netplan_written is changed
+    - local_netplan_kubelet_binary.stat.exists
+
+- name: Verify the host resolver has no search domain
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      rc_file=/run/systemd/resolve/resolv.conf
+      if [ ! -f "$rc_file" ]; then
+        echo "RESOLV_CONFD_MISSING"
+        exit 0
+      fi
+      # "search ." is systemd-resolved's benign no-domain marker — harmless.
+      # Anything else is a real search domain and will leak into pod
+      # resolv.conf (ndots:5) and hijack in-cluster DNS names.
+      domains=$(awk '/^[[:space:]]*search[[:space:]]/ { for (i = 2; i <= NF; i++) print $i }' "$rc_file" \
+                | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+                | grep -v '^$' | grep -v '^\.$' || true)
+      if [ -n "$domains" ]; then
+        echo "SEARCH_DOMAIN_PRESENT"
+        echo "$domains"
+        exit 1
+      fi
+      echo "NO_SEARCH_DOMAIN"
+    executable: /bin/bash
+  register: local_netplan_resolv_check
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Show resolver state
+  ansible.builtin.debug:
+    var: local_netplan_resolv_check.stdout_lines
