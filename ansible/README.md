@@ -199,6 +199,9 @@ Two things that bite here:
   - On edge-01, the established socket on `:443` shows the **real public
     client** as peer (e.g. `103.189.143.226:6266`). The VPS DNATs `:443` to
     the edge and **preserves the source IP** — no proxying happens there.
+    Note: in this lab `103.189.143.226` is the lab's *own* public egress
+    address (confirmed with `https://api.ipify.org` run from edge-01), so the
+    traffic being measured comes from the lab itself, not a third party.
   - Envoy on the nodes logs `"remote_address":"192.168.16.30:<port>"` for every
     internet request, and `x_forwarded_for` is the same single value.
   - Cause: edge HAProxy runs `mode tcp` (pure TCP tunnel — it opens a *new*
@@ -245,6 +248,32 @@ forwarded traffic — health-check connections are separate, and HAProxy only
 puts the PROXY header on them when `check-send-proxy` is set. Without it the
 check connection arrives without a header and Envoy closes it.
 
+**Verified on the running lab (2026-11-02)**
+
+- Envoy access log after the cutover, for **real third-party traffic** that
+  happened to reach the public listener:
+
+  ```
+  "remote_address":"45.148.10.120:60024",
+  "x_forwarded_for":"45.148.10.120",
+  "x_envoy_external_address":"45.148.10.120"
+  ```
+
+  Before the cutover every one of those lines read
+  `"remote_address":"192.168.16.30:<port>"`.
+- A spoof attempt (`X-Forwarded-For: 9.9.9.9`) is logged as
+  `xff= 9.9.9.9,103.189.143.226` — the forged value stays **left** of the
+  authoritative entry, so it does not win.
+- `x_envoy_external_address` is now populated (it was `null` before, because
+  a request with no XFF from a RFC1918 downstream counts as *internal*).
+- A connection to `node-01:443` **without** a PROXY header hangs until the
+  client times out — Envoy is waiting for the header, i.e. PROXY is genuinely
+  required, not optional.
+- `K8SGW` counters on node-01: `ACCEPT` 3213 pkts (`:80`) / 3264 pkts (`:443`)
+  from the edge, `DROP` 5 pkts on `:443` from everything else.
+- All six HAProxy backends (`k8s-http` / `k8s-https` × node-01/02/03) report
+  `status= UP`.
+
 **What PROXY protocol costs**
 
 - Cilium's `gatewayAPI.enableProxyProtocol` is **operator-global**, not
@@ -259,6 +288,27 @@ check connection arrives without a header and Envoy closes it.
     role, which drops everything except the edge.
 - The Kubernetes API port (6443) is untouched — the API backends keep plain
   TCP.
+
+**Why the `K8SGW` jump must be the FIRST rule in `INPUT`**
+
+Cilium re-inserts its own `CILIUM_INPUT` jump at position 1 of `INPUT` every
+time the agent restarts, which pushes `K8SGW` down the chain.
+`CILIUM_INPUT` contains exactly one rule:
+
+```
+-A CILIUM_INPUT -m mark --mark 0x200/0xf00 -j ACCEPT
+```
+
+That accepts Cilium-proxied traffic (mark `0x200`). If `K8SGW` sits behind
+it, in-cluster traffic that reaches the Gateway over Cilium's proxy path is
+ACCEPTed before the `K8SGW` DROP rules are ever evaluated — and such a
+connection could smuggle its own PROXY header and forge a client IP.
+
+The role therefore re-asserts the jump position on every run
+(`Ensure the K8SGW jump is the first rule in INPUT`): it deletes the
+misplaced jump and re-inserts it at position 1. Do not "simplify" that task
+away — `iptables -I INPUT 1` alone is not enough, because the ordering
+decays again on the next Cilium restart.
 
 **Cutover**
 
@@ -285,6 +335,24 @@ installed until the chain is removed explicitly
 
 **Diagnostics after the cutover**
 
+Backend state without HTTP — the edge HAProxy exposes an admin unix socket
+(`/var/run/haproxy-admin.sock`), so `show stat` works from a playbook or by
+hand without opening a network port:
+
+```bash
+# from edge-01
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX)
+s.connect('/var/run/haproxy-admin.sock')
+s.sendall(b'show stat\n')
+for line in s.recv(200000).decode().splitlines():
+    if ('k8s-http' in line or 'k8s-https' in line) and not line.startswith('#'):
+        f = line.split(',')
+        print(f[0], f[1], f[17])   # proxy, server, status
+PY
+```
+
 In-cluster access is closed, so probe from the edge:
 
 ```bash
@@ -301,6 +369,13 @@ A direct connection from another node must fail:
 ```bash
 # from node-02 — no PROXY header, and the firewall drops it anyway
 nc -zv 192.168.16.25 443     # expect: refused / timeout
+```
+
+Watch the firewall counters to confirm what is being dropped:
+
+```bash
+# from any node
+iptables -t filter -L K8SGW -n -v
 ```
 
 To generate in-cluster traffic without a workstation curl, run a throwaway

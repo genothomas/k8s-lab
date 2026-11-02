@@ -50,23 +50,53 @@
   hosts: edge
   become: true
   tasks:
-    - name: Fetch the HAProxy statistics
-      ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ haproxy_stats_port }}/stats;csv"
-        return_content: true
+    # `show stat` over the admin unix socket — no HTTP, so this works even
+    # when the stats frontend is firewalled or unreachable.
+    - name: Read the HAProxy backend states from the admin socket
+      ansible.builtin.shell:
+        cmd: |
+          python3 - <<'PY'
+          import socket
+          s = socket.socket(socket.AF_UNIX)
+          s.connect('/var/run/haproxy-admin.sock')
+          s.sendall(b'show stat\n')
+          data = b''
+          while True:
+              chunk = s.recv(65536)
+              if not chunk:
+                  break
+              data += chunk
+          for line in data.decode().splitlines():
+              if line.startswith('#'):
+                  continue
+              f = line.split(',')
+              if f[0] not in ('k8s-http', 'k8s-https'):
+                  continue
+              if f[1] in ('FRONTEND', 'BACKEND'):
+                  print(f"# {f[0]} {f[1]} {f[17]}")
+                  continue
+              print(f"{f[0]},{f[1]},{f[17]}")
+          PY
+        executable: /bin/bash
       register: haproxy_stats
       retries: 10
       delay: 3
-      until: haproxy_stats is succeeded
+      until: haproxy_stats.rc == 0
       changed_when: false
 
     - name: Show the Gateway backend states
       ansible.builtin.debug:
+        msg: "{{ haproxy_stats.stdout_lines }}"
+
+    - name: Fail when a Gateway backend server is not UP
+      ansible.builtin.fail:
         msg: >-
-          {{ haproxy_stats.content.split('\n')
-             | select('search', 'k8s-http|k8s-https')
-             | select('search', 'master|node1|node2')
-             | list }}
+          A Gateway backend server is not UP:
+          {{ haproxy_stats.stdout_lines | reject('search', 'UP') | list }}
+      when: >-
+        haproxy_stats.stdout_lines | reject('search', '^#') | list | length > 0
+        and (haproxy_stats.stdout_lines | reject('search', '^#') | list
+             | reject('search', 'UP') | list | length) > 0
 
     - name: Request the demo app over the public path
       ansible.builtin.uri:

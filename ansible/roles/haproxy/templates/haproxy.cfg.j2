@@ -3,6 +3,11 @@ global
     log /dev/log local1 notice
     maxconn 2000
     daemon
+    # Admin socket for runtime introspection (`show stat`) over a unix
+    # socket — no HTTP, so it can be queried from a playbook or by hand
+    # without opening a network port.
+    stats socket /var/run/haproxy-admin.sock mode 660 level admin
+    stats timeout 30s
 
 defaults
     log     global

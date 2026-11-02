@@ -1,49 +1,117 @@
 ---
-# HAProxy 3.2 LTS from community PPA (vbernat). Ubuntu 24.04 ships
-# 2.8.x LTS (EOL 2028 Q2); upstream 3.2 branch is LTS until 2030 Q2.
-# vbernat PPA is the de-facto upstream-equivalent for Ubuntu (the
-# haproxy.debian.net repo only carries Debian, no noble directory).
-# Lab config uses TCP mode + simple frontends — no breaking changes
-# between 2.8 → 3.2.
+# HAProxy 3.2 LTS. Ubuntu 24.04 ships 2.8.x LTS (EOL 2028 Q2); upstream 3.2
+# branch is LTS until 2030 Q2. Two sources are possible:
+#
+#   * the community PPA (vbernat/haproxy-3.2) — the de-facto upstream
+#     equivalent for Ubuntu (the haproxy.debian.net repo only carries
+#     Debian, no noble directory). Its package is named `haproxy`.
+#   * Ubuntu's own `haproxy-awslc` build, already present on the edge box.
+#     It ships the same /usr/sbin/haproxy path, so the two packages conflict
+#     at the file level and apt cannot swap them without removing the other.
+#
+# So: keep a working haproxy that already satisfies the minimum version, and
+# only fall back to the PPA when there is nothing usable installed. That keeps
+# the role idempotent and re-runnable (e.g. `make local-gateway-proxy`).
+#
+# Lab config uses TCP mode + simple frontends — no breaking changes between
+# 2.8 → 3.2.
 
-- name: Remove any stale haproxy.debian.net repo from prior attempts
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/apt/sources.list.d/haproxy.list
-    - /etc/apt/keyrings/haproxy-archive-keyring.gpg
+- name: Detect the installed haproxy version
+  ansible.builtin.command:
+    cmd: haproxy -v
+  register: haproxy_version_probe
+  changed_when: false
+  failed_when: false
 
-# Launchpad PPA key for vbernat/haproxy-3.2. Fetched once and
-# referenced by signed_by on the deb822 source. Keyserver.ubuntu.com
-# returns raw ASCII-armored key when op=get is set.
-- name: Fetch vbernat haproxy-3.2 PPA signing key
-  ansible.builtin.get_url:
-    url: https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x3D653970FBAB0A890E4E4E9A0F14D8B0CF4EFE96
-    dest: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
-    mode: "0644"
-    owner: root
-    group: root
+- name: Record the installed haproxy version
+  ansible.builtin.set_fact:
+    haproxy_installed_version: >-
+      {{ haproxy_version_probe.stdout.split()[2]
+         if haproxy_version_probe.stdout | default('') | split() | length > 2
+         else '' }}
 
-- name: Add vbernat haproxy-3.2 PPA (deb822)
-  ansible.builtin.deb822_repository:
-    name: vbernat-haproxy-3-2
-    types: [deb]
-    uris: https://ppa.launchpadcontent.net/vbernat/haproxy-3.2/ubuntu
-    suites: [noble]
-    components: [main]
-    signed_by: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
-    state: present
+- name: Record the installed haproxy major.minor
+  ansible.builtin.set_fact:
+    haproxy_installed_major: "{{ haproxy_installed_version.split('.')[0] | int }}"
+    haproxy_installed_minor: "{{ haproxy_installed_version.split('.')[1] | int }}"
 
-- name: Install haproxy (pinned to 3.2.x)
-  ansible.builtin.apt:
-    name: "haproxy=3.2.*"
-    state: present
-    update_cache: true
+- name: Record the minimum required haproxy major.minor
+  ansible.builtin.set_fact:
+    haproxy_min_major: "{{ haproxy_min_version.split('.')[0] | int }}"
+    haproxy_min_minor: "{{ haproxy_min_version.split('.')[1] | int }}"
 
-- name: Hold haproxy version
+# Integer comparison (major*100 + minor) — the `version` filter is gone from
+# ansible-core 2.21 and the `version` test is awkward in a `when:` clause.
+- name: Decide whether the PPA package is needed
+  ansible.builtin.set_fact:
+    haproxy_needs_ppa: >-
+      {{ (haproxy_installed_major | int) * 100 + (haproxy_installed_minor | int)
+         < (haproxy_min_major | int) * 100 + (haproxy_min_minor | int) }}
+
+- name: Find the package that owns the haproxy binary
+  ansible.builtin.command:
+    cmd: dpkg -S /usr/sbin/haproxy
+  register: haproxy_binary_owner
+  changed_when: false
+  failed_when: false
+
+- name: Record the owning package
+  ansible.builtin.set_fact:
+    haproxy_installed_package: >-
+      {{ haproxy_binary_owner.stdout.split(':')[0]
+         if haproxy_binary_owner.stdout | default('') | length > 0
+         else haproxy_apt_package }}
+
+- name: Report the haproxy build in use
+  ansible.builtin.debug:
+    msg: >-
+      installed haproxy={{ haproxy_installed_version }}
+      package={{ haproxy_installed_package }}
+      (PPA install required: {{ haproxy_needs_ppa | bool }})
+
+# Everything PPA-specific is skipped when a suitable haproxy is already
+# installed — the repo would otherwise be added but never used.
+- name: Configure the PPA haproxy package
+  when: haproxy_needs_ppa | bool
+  block:
+    - name: Remove any stale haproxy.debian.net repo from prior attempts
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/haproxy.list
+        - /etc/apt/keyrings/haproxy-archive-keyring.gpg
+
+    # Launchpad PPA key for vbernat/haproxy-3.2. Fetched once and
+    # referenced by signed_by on the deb822 source. Keyserver.ubuntu.com
+    # returns raw ASCII-armored key when op=get is set.
+    - name: Fetch vbernat haproxy-3.2 PPA signing key
+      ansible.builtin.get_url:
+        url: https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x3D653970FBAB0A890E4E4E9A0F14D8B0CF4EFE96
+        dest: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
+        mode: "0644"
+        owner: root
+        group: root
+
+    - name: Add vbernat haproxy-3.2 PPA (deb822)
+      ansible.builtin.deb822_repository:
+        name: vbernat-haproxy-3-2
+        types: [deb]
+        uris: https://ppa.launchpadcontent.net/vbernat/haproxy-3.2/ubuntu
+        suites: [noble]
+        components: [main]
+        signed_by: /etc/apt/keyrings/vbernat-haproxy-3-2.asc
+        state: present
+
+    - name: Install haproxy (pinned to 3.2.x)
+      ansible.builtin.apt:
+        name: "{{ haproxy_apt_package }}={{ haproxy_apt_version }}"
+        state: present
+        update_cache: true
+
+- name: Hold the haproxy package version
   ansible.builtin.dpkg_selections:
-    name: haproxy
+    name: "{{ haproxy_installed_package }}"
     selection: hold
 
 - name: Enable haproxy

@@ -27,18 +27,45 @@
         - { question: "iptables-persistent/autosave_v4", value: "true", vtype: "boolean" }
         - { question: "iptables-persistent/autosave_v6", value: "false", vtype: "boolean" }
 
+    # chain_management is what actually runs `iptables -N`. Without it the
+    # module only reports that the chain is missing and creates nothing.
     - name: Create the {{ gateway_firewall_chain }} chain
       ansible.builtin.iptables:
         chain: "{{ gateway_firewall_chain }}"
+        chain_management: true
         state: present
 
     - name: Jump to the {{ gateway_firewall_chain }} chain from INPUT
       ansible.builtin.iptables:
         chain: INPUT
         jump: "{{ gateway_firewall_chain }}"
-        insert: true
-        position: "1"
+        action: insert
+        rule_num: "1"
         comment: "k8s-lab: Gateway listener access control"
+
+    # Cilium re-inserts its own CILIUM_INPUT jump at position 1 of INPUT
+    # every time the agent restarts, which pushes K8SGW further down the
+    # chain. CILIUM_INPUT ACCEPTs traffic marked 0x200 (Cilium-proxied
+    # traffic) — in-cluster traffic that reaches the Gateway over that path
+    # would then never reach the K8SGW DROP rules and could smuggle its own
+    # PROXY header, forging a client IP. So K8SGW has to be first, and the
+    # position is re-asserted on every run instead of trusted.
+    - name: Ensure the {{ gateway_firewall_chain }} jump is the first rule in INPUT
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          if iptables -t filter -S INPUT | sed -n '2p' | grep -q -- '-j {{ gateway_firewall_chain }}'; then
+            echo "JUMP_FIRST_OK"
+          else
+            iptables -t filter -D INPUT -j {{ gateway_firewall_chain }} \
+              -m comment --comment "k8s-lab: Gateway listener access control" || true
+            iptables -t filter -I INPUT 1 -j {{ gateway_firewall_chain }} \
+              -m comment --comment "k8s-lab: Gateway listener access control"
+            echo "JUMP_REMOVED"
+          fi
+        executable: /bin/bash
+      register: gateway_firewall_jump_position
+      changed_when: "'JUMP_REMOVED' in gateway_firewall_jump_position.stdout"
 
     - name: Allow the edge HAProxy to reach the Gateway listeners
       ansible.builtin.iptables:
