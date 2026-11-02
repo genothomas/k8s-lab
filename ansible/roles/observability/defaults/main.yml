@@ -8,9 +8,11 @@ vm_chart_name: vm/victoria-metrics-k8s-stack
 vm_chart_url: https://victoriametrics.github.io/helm-charts
 vm_version: "0.95.0"
 
-# Default admin/admin — change before any non-lab exposure.
+# Admin user is not a secret; the password is. It comes from the
+# GRAFANA_ADMIN_PASSWORD env var (see group_vars/all.yml) so it never
+# lands in the repo — the observability tier exposes Grafana publicly.
 grafana_admin_user: admin
-grafana_admin_password: wittysilk63
+grafana_admin_password: ""
 
 retention_hours: 24
 

@@ -32,6 +32,10 @@
       - "kubelet={{ kubernetes_version }}-*"
       - "kubeadm={{ kubernetes_version }}-*"
       - "kubectl={{ kubernetes_version }}-*"
+      # crictl — CRI client for containerd. The cleanup playbook uses it to
+      # prune unused images before a snapshot, and it is the only way to see
+      # what the CRI plugin actually holds without going through ctr.
+      - "cri-tools={{ kubernetes_cri_tools_version }}-*"
     state: present
     update_cache: true
   when: not ansible_check_mode

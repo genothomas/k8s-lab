@@ -6,9 +6,77 @@
 # cluster state (/var/lib/etcd, /var/lib/containerd, /etc/kubernetes) — a
 # snapshot is meant to restore a working cluster.
 #
-# Note: /tmp is swept LAST. Ansible writes its own module payload files
-# (ansible_ansible.legacy.*) into the remote temp dir on every command task,
-# so sweeping /tmp before the command tasks only relocates the litter.
+# Two plays, in this order:
+#
+#   1. Cluster play  — drops dead kubeadm bootstrap tokens. Runs on the first
+#      control plane only (run_once), needs kubectl, so it cannot live in the
+#      `hosts: all` play: edge-01 has no kubectl.
+#   2. Host play     — the per-VM cleanup, on every host including edge-01.
+#
+# The order matters: Ansible writes its own module payload files
+# (ansible_ansible.legacy.*) into the remote temp dir on every command/shell
+# task. The /tmp sweep is the last task of the last play, so anything the
+# cluster play leaves behind in /tmp is swept too. Sweeping /tmp earlier only
+# relocates the litter.
+#
+# Snapshot-relevant extras are opt-in via vars (see below). `make
+# local-cleanup-snapshot` turns on the safe ones; image pruning stays off by
+# default because it forces a full image re-pull on restore.
+
+- name: Cluster-level cleanup for snapshot
+  hosts: control_plane
+  become: true
+  run_once: true
+  vars:
+    cleanup_kubeconfig: /etc/kubernetes/admin.conf
+
+    # Delete leftover kubeadm bootstrap tokens.
+    #
+    # Every node has already joined, so any bootstrap token still in the
+    # cluster is dead weight — kubeadm does not delete the token it consumed
+    # on join; kube-controller-manager's tokencleaner GC's it once it expires.
+    # Leaving them in the snapshot means restoring a token that is either
+    # expired or, worse, still valid and usable to join a rogue node.
+    #
+    # A fresh kubeadm token has a 1h TTL, so in practice the cleaner has
+    # already removed them and this task is a no-op. It runs anyway so the
+    # snapshot is deterministic regardless of when it was taken.
+    #
+    # Caveat: do NOT run this while a node join is in flight — the join
+    # consumes the token.
+    cleanup_bootstrap_tokens: true
+
+  tasks:
+    - name: List bootstrap token secrets
+      ansible.builtin.shell:
+        cmd: >-
+          kubectl --kubeconfig={{ cleanup_kubeconfig }} -n kube-system get secrets
+          -o name | grep -E 'secret/bootstrap-token-' || true
+      register: cleanup_bootstrap_token_secrets
+      changed_when: false
+      check_mode: false
+      when: cleanup_bootstrap_tokens | bool
+
+    - name: Show which bootstrap token secrets will be deleted
+      ansible.builtin.debug:
+        msg: >-
+          {{ cleanup_bootstrap_token_secrets.stdout_lines | default([])
+             | map('regex_replace', '^secret/', '') | list
+             | join(', ') if cleanup_bootstrap_token_secrets.stdout_lines | default([]) | length > 0
+             else "(none — no bootstrap tokens left in kube-system)" }}
+      when: cleanup_bootstrap_tokens | bool
+
+    - name: Delete bootstrap token secrets
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ cleanup_kubeconfig }} -n kube-system delete secret
+          --ignore-not-found {{ item | regex_replace('^secret/', '') }}
+      loop: "{{ cleanup_bootstrap_token_secrets.stdout_lines | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: "'deleted' in stdout"
+      when: cleanup_bootstrap_tokens | bool
+
 - name: Cleanup host for snapshot
   hosts: all
   become: true
@@ -49,6 +117,50 @@
     # the lab's uplink is slow, and `apt-get update` costs a round trip.
     cleanup_purge_apt_lists: false
 
+    # Remove the helm repository cache (~6 MB). `cluster-gateway.yml` and the
+    # observability playbook both run `helm repo add --force-update` before
+    # they need it, so a missing cache is not a problem.
+    cleanup_helm_cache: false
+
+    # Remove kubelet's per-pod container logs under /var/log/pods. Small
+    # (~2 MB) but they are the first thing anyone reads after a restore.
+    cleanup_pod_logs: false
+
+    # Remove exited containers. Safe — the container has already exited, the
+    # kubelet knows about it, and containerd keeps its writable snapshot layer
+    # on disk until the container record is deleted. Leftovers come from pod
+    # restarts and from the node reboots, and they are the reason the disk
+    # usage of the nodes drifts apart: node-03 held 11 exited containers and
+    # 188 overlayfs snapshots against node-02's 147.
+    #
+    # The kubelet GCs exited containers itself once the owning pod is gone,
+    # but the ones belonging to a still-running pod (a restarted container)
+    # stay until the pod is recreated.
+    cleanup_prune_exited_containers: false
+
+    # Prune unused container images. OFF by default and not part of
+    # `make local-cleanup-snapshot`:
+    #
+    # `crictl rmi --prune` removes every image not referenced by a running
+    # container, including images of Deployments that are scaled to 0 and
+    # images of pods that have not been created yet. After a restore those
+    # images must be re-pulled over the WireGuard tunnel — a slow restore, and
+    # a broken one if the tunnel or the registry is unavailable.
+    #
+    # In this lab almost every image is in use (17-19 images, all running),
+    # so the reclaim is small next to the risk. Enable it only when snapshot
+    # size matters more than restore speed.
+    cleanup_prune_containerd_images: false
+
+    # cri-tools is only a convenience client for the CRI plugin. Nodes may
+    # already have a manual /usr/local/bin/crictl, so the apt package is
+    # installed only when no crictl answers at all.
+    cleanup_cri_tools_package: cri-tools
+
+    # crictl is needed for either of the two container-runtime prune steps.
+    cleanup_crictl_required: >-
+      {{ (cleanup_prune_exited_containers | bool) or (cleanup_prune_containerd_images | bool) }}
+
   tasks:
     - name: Remove editor and pager state
       ansible.builtin.file:
@@ -71,17 +183,123 @@
       loop: "{{ cleanup_ansible_tmp }}"
       when: not ansible_check_mode
 
+    - name: Remove helm repository cache
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /root/.cache/helm
+        - /home/ubuntu/.cache/helm
+      when:
+        - cleanup_helm_cache | bool
+        - not ansible_check_mode
+
+    - name: Find kubelet pod log files
+      ansible.builtin.find:
+        paths: /var/log/pods
+        patterns: "*.log"
+        file_type: file
+      register: cleanup_pod_log_files
+      when:
+        - cleanup_pod_logs | bool
+        - not ansible_check_mode
+
+    - name: Remove kubelet pod log files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ cleanup_pod_log_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when:
+        - cleanup_pod_logs | bool
+        - not ansible_check_mode
+
+    - name: Check for the containerd CRI socket
+      ansible.builtin.stat:
+        path: /run/containerd/containerd.sock
+      register: cleanup_containerd_sock
+      when:
+        - cleanup_crictl_required | bool
+        - not ansible_check_mode
+
+    # cri-tools must be installed BEFORE the apt indexes are purged below,
+    # and only when no crictl answers at all.
+    - name: Check for crictl
+      ansible.builtin.command:
+        cmd: crictl --version
+      register: cleanup_crictl
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when:
+        - cleanup_crictl_required | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+
+    - name: Install cri-tools for image pruning
+      ansible.builtin.apt:
+        name: "{{ cleanup_cri_tools_package }}"
+        state: present
+        update_cache: false
+      when:
+        - cleanup_crictl_required | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+        - cleanup_crictl.rc | default(1) != 0
+        - not ansible_check_mode
+
+    - name: List exited containers
+      ansible.builtin.command:
+        cmd: crictl ps -a --state exited -q
+      register: cleanup_exited_containers
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when:
+        - cleanup_prune_exited_containers | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+
+    - name: Show how many exited containers will be removed
+      ansible.builtin.debug:
+        msg: "{{ cleanup_exited_containers.stdout_lines | default([]) | length }} exited container(s)"
+      when:
+        - cleanup_prune_exited_containers | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+
+    - name: Remove exited containers
+      ansible.builtin.command:
+        cmd: crictl rm {{ item }}
+      loop: "{{ cleanup_exited_containers.stdout_lines | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - cleanup_prune_exited_containers | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+
+    - name: Prune unused container images
+      ansible.builtin.command:
+        cmd: crictl rmi --prune
+      changed_when: true
+      when:
+        - cleanup_prune_containerd_images | bool
+        - cleanup_containerd_sock.stat.exists | default(false)
+        - not ansible_check_mode
+
     - name: Clear apt package cache
       ansible.builtin.apt:
         clean: true
         autoclean: true
       when: not ansible_check_mode
 
+    # Removes the package index files themselves. `apt` recreates the
+    # directory on the next `apt-get update`.
     - name: Purge apt package indexes
-      ansible.builtin.apt:
-        update_cache: false
+      ansible.builtin.file:
+        path: /var/lib/apt/lists
+        state: absent
       when:
-        - cleanup_purge_apt_lists
+        - cleanup_purge_apt_lists | bool
         - not ansible_check_mode
 
     - name: Vacuum systemd journal
@@ -104,7 +322,7 @@
     # file (ansible_ansible.legacy.command_payload_*) into the remote temp
     # dir for every command/shell task, so any sweep before the final
     # command task just relocates the litter. This one has to run after
-    # every other task to be effective.
+    # every other task — including the cluster play above — to be effective.
     - name: Find operator scratch files in /tmp
       ansible.builtin.find:
         paths: /tmp

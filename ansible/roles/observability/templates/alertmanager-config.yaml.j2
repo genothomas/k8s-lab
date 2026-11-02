@@ -4,7 +4,52 @@
 # spec.configSecret. We provide both keys for compat.
 # Receivers must be non-empty strings — YAML null is rejected as
 # "missing name in receiver".
+#
+# Both receivers carry the SAME webhook. The severity split exists so the
+# two channels can diverge later (different topics, different payloads),
+# but a receiver with no webhook_configs silently drops its alerts — so
+# every receiver here must have one. An alert routes to exactly one
+# receiver (continue: false), so this does not double-notify.
+#
+# group_by is set explicitly. Alertmanager's default group_by is "all
+# labels except alertname", which makes .CommonLabels.alertname ALWAYS
+# empty and .CommonAnnotations.summary empty too (annotations are not
+# labels). A Common*-based payload then delivers blank alertname /
+# summary / description for every notification. Grouping by alertname
+# makes each notification a single alert, so Common* carries the real
+# values. It also gives one ntfy message per alert instead of one per
+# label-set.
 
+{% set webhook_block %}
+            send_resolved: true
+            max_alerts: 0
+            # lab_runbook_url alongside the upstream runbook_url (chart's
+            # defaultRules embed runbooks.prometheus-operator.dev URLs).
+            #
+            # EVERY value goes through `toJson`. Alertmanager requires the
+            # webhook payload to be valid JSON, and alert descriptions
+            # routinely carry double quotes and newlines. Interpolating
+            # them raw — the obvious direct template call — drops an
+            # unescaped quote inside a JSON string, so the body stops
+            # being JSON. The breakage is invisible here: ntfy.sh parses
+            # a valid body and re-serialises it (compact, keys sorted),
+            # but stores an invalid one as raw text. The same alert
+            # therefore reaches ntfy in two different shapes depending on
+            # whether its description happens to contain a quote, and any
+            # JSON consumer of the topic sees a syntax error for half the
+            # alerts.
+            payload: |
+              {
+                "status": {% raw %}{{ .Status | toJson }}{% endraw %},
+                "alertname": {% raw %}{{ .CommonLabels.alertname | toJson }}{% endraw %},
+                "severity": {% raw %}{{ .CommonLabels.severity | toJson }}{% endraw %},
+                "summary": {% raw %}{{ .CommonAnnotations.summary | toJson }}{% endraw %},
+                "description": {% raw %}{{ .CommonAnnotations.description | toJson }}{% endraw %},
+                "runbook_url": {% raw %}{{ .CommonAnnotations.runbook_url | toJson }}{% endraw %},
+                "fingerprint": {% raw %}{{ (index .Alerts 0).Fingerprint | toJson }}{% endraw %},
+                "lab_runbook_url": "https://runbooks.{{ dns_zone }}/{% raw %}{{ .CommonLabels.alertname }}{% endraw %}"
+              }
+{% endset %}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -18,6 +63,7 @@ stringData:
   alertmanager.yaml: |
     route:
       receiver: default
+      group_by: ['alertname', 'severity']
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 4h
@@ -31,21 +77,10 @@ stringData:
           receiver: default
     receivers:
       - name: default
+        webhook_configs:
+          - url: {{ alertmanager_webhook_url | mandatory }}
+{{ webhook_block }}
       - name: primary
         webhook_configs:
           - url: {{ alertmanager_webhook_url | mandatory }}
-            send_resolved: true
-            max_alerts: 0
-            # lab_runbook_url alongside the upstream runbook_url (chart's
-            # defaultRules embed runbooks.prometheus-operator.dev URLs).
-            payload: |
-              {
-                "status": "{% raw %}{{ .Status }}{% endraw %}",
-                "alertname": "{% raw %}{{ .CommonLabels.alertname }}{% endraw %}",
-                "severity": "{% raw %}{{ .CommonLabels.severity }}{% endraw %}",
-                "summary": "{% raw %}{{ .CommonAnnotations.summary }}{% endraw %}",
-                "description": "{% raw %}{{ .CommonAnnotations.description }}{% endraw %}",
-                "runbook_url": "{% raw %}{{ .CommonAnnotations.runbook_url }}{% endraw %}",
-                "lab_runbook_url": "https://runbooks.{{ dns_zone }}/{% raw %}{{ .CommonLabels.alertname }}{% endraw %}",
-                "fingerprint": "{% raw %}{{ (index .Alerts 0).Fingerprint }}{% endraw %}"
-              }
+{{ webhook_block }}

@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+dns_zone      = "dotunet.com"
+dns_subdomain = "svc"
+edge_public_ip = "152.67.31.10"

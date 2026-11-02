@@ -18,7 +18,7 @@ WAIT_TIMEOUT  ?= 360
 WAIT_INTERVAL ?= 10
 
 .PHONY: all help check ping terraform inventory bootstrap k8s cni gateway cert observability demo haproxy clean destroy nuke wait-ready test \
-        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo local-test local-cleanup local-all
+        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo local-test local-cleanup local-cleanup-snapshot local-all
 
 .DEFAULT_GOAL := check
 
@@ -80,6 +80,11 @@ cert: check
 	$(ANS) ansible/playbooks/cluster-cert.yml
 
 observability: check
+	@if [ -z "$$GRAFANA_ADMIN_PASSWORD" ]; then \
+		echo "ERROR: GRAFANA_ADMIN_PASSWORD unset."; \
+		echo "Export it (12+ chars) — Grafana is served on the public https listener."; \
+		exit 1; \
+	fi
 	$(ANS) ansible/playbooks/cluster-observability.yml
 
 demo: check
@@ -176,7 +181,14 @@ local-cert: local-check
 	fi
 	$(LOCAL_ANS) ansible/playbooks/cluster-cert.yml
 
+# Grafana is published on the public https listener, so its admin
+# password comes from the environment — never from the repo.
 local-observability: local-check
+	@if [ -z "$$GRAFANA_ADMIN_PASSWORD" ]; then \
+		echo "ERROR: GRAFANA_ADMIN_PASSWORD unset."; \
+		echo "Export it (12+ chars) — Grafana is served on the public https listener."; \
+		exit 1; \
+	fi
 	$(LOCAL_ANS) ansible/playbooks/cluster-observability.yml
 
 local-demo: local-check
@@ -189,6 +201,24 @@ local-test:
 # so they can be snapshotted.
 local-cleanup: local-check
 	$(LOCAL_ANS) ansible/playbooks/cleanup.yml
+
+# Snapshot-grade cleanup: also purges the apt package indexes, clears kubelet
+# pod logs and the helm cache, drops dead kubeadm bootstrap tokens, and
+# removes the Exited container records left by pod restarts and node reboots
+# (each one pins a containerd overlayfs snapshot).
+#
+# Container IMAGE pruning is deliberately NOT enabled here: `crictl rmi
+# --prune` drops the images of any Deployment that is scaled to 0, which
+# forces a full re-pull over the WireGuard tunnel on restore. Add
+#   -e cleanup_prune_containerd_images=true
+# to the cleanup.yml invocation if snapshot size matters more than restore
+# speed.
+local-cleanup-snapshot: local-check
+	$(LOCAL_ANS) ansible/playbooks/cleanup.yml \
+	  -e cleanup_purge_apt_lists=true \
+	  -e cleanup_pod_logs=true \
+	  -e cleanup_helm_cache=true \
+	  -e cleanup_prune_exited_containers=true
 
 local-all: local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo
 	@$(MAKE) local-test
@@ -239,6 +269,7 @@ help:
 	@echo "  local-demo          - cluster-demo.yml (podinfo demo)"
 	@echo "  local-test          - HTTP GET probes via edge-01 (local inventory)"
 	@echo "  local-cleanup       - cleanup.yml (scratch files, history, apt cache, journal)"
+	@echo "  local-cleanup-snapshot - cleanup.yml + apt indexes, pod logs, helm cache, bootstrap tokens"
 	@echo "  local-all           - full local pipeline"
 	@echo ""
 	@echo "Tunables (env or cmdline):"

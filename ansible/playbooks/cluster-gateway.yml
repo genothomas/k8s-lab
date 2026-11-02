@@ -8,6 +8,7 @@
     cilium_version: "1.20.2"
     cilium_chart_repo: cilium
     cilium_chart_name: cilium/cilium
+    cilium_chart_url: https://helm.cilium.io
     gateway_api_version: "1.6.2"
     cilium_kube_proxy_replacement: true
     cilium_ipam_mode: kubernetes
@@ -54,6 +55,23 @@
         dest: /tmp/cilium-overrides.yaml
         mode: "0644"
 
+    # This playbook must be runnable on its own — the repo index it upgrades
+    # from is a local cache under /root/.cache/helm, and that cache is not
+    # guaranteed to exist (a fresh node, a cleaned host, or a fresh snapshot).
+    # Refresh it here so the upgrade never depends on a prior playbook run.
+    - name: Add Cilium Helm repo
+      ansible.builtin.command:
+        cmd: helm repo add {{ cilium_chart_repo }} {{ cilium_chart_url }} --force-update
+      register: helm_repo_add
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Update Helm repos
+      ansible.builtin.command: helm repo update
+      register: helm_repo_update
+      changed_when: false
+      when: not ansible_check_mode
+
     - name: Upgrade Cilium — Gateway API enabled, Ingress disabled
       ansible.builtin.command:
         cmd: >-
@@ -73,13 +91,42 @@
           -f /tmp/cilium-overrides.yaml
           --wait --timeout 10m
       register: cilium_upgrade
-      changed_when: "'UPGRADED RELEASE' in cilium_upgrade.stdout"
+      changed_when: "'has been upgraded' in cilium_upgrade.stdout"
       when: not ansible_check_mode
 
     - name: Wait for cilium DaemonSet rollout
       ansible.builtin.command:
         cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status ds/cilium --timeout=300s
       register: ds_rollout
+      changed_when: false
+      when: not ansible_check_mode
+
+    # The cilium-agent reads enable-gateway-api / gateway-api-hostnetwork-enabled
+    # from the cilium-config ConfigMap at startup only. `helm upgrade` writes
+    # that ConfigMap but does not change the DaemonSet pod template, so no pod
+    # is recreated and the agent keeps running with Gateway API disabled —
+    # cilium-envoy then never binds host 80/443. Restart both DaemonSets so
+    # the agents pick up the new config.
+    - name: Restart cilium + cilium-envoy (pick up gateway config)
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }}
+          rollout restart ds/cilium ds/cilium-envoy
+      register: ds_restart_gw
+      changed_when: "'restarted' in ds_restart_gw.stdout"
+      when: not ansible_check_mode
+
+    - name: Wait for cilium DaemonSet rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status ds/cilium --timeout=300s
+      register: ds_rollout2
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Wait for cilium-envoy DaemonSet rollout
+      ansible.builtin.command:
+        cmd: kubectl --kubeconfig={{ kubeconfig }} -n {{ cilium_namespace }} rollout status ds/cilium-envoy --timeout=300s
+      register: envoy_rollout
       changed_when: false
       when: not ansible_check_mode
 
@@ -161,6 +208,28 @@
 
         - name: Print Gateway status
           ansible.builtin.debug: { var: gw_status.stdout_lines }
+
+        # The Gateway only works if cilium-envoy bound host :80 on the node
+        # the Gateway address points at. Check the socket, not the Gateway
+        # status — the status is Programmed=True even when the agent never
+        # reloaded enable-gateway-api and envoy listens on nothing.
+        - name: Verify cilium-envoy is listening on host port 80
+          ansible.builtin.shell:
+            cmd: ss -ltn | grep -q ':80 ' && echo "HOST80_BOUND" || echo "HOST80_MISSING"
+            executable: /bin/bash
+          register: gw_host80
+          changed_when: false
+
+        - name: Print host port 80 state
+          ansible.builtin.debug: { var: gw_host80.stdout_lines }
+
+        - name: Fail when cilium-envoy is not bound on host port 80
+          ansible.builtin.fail:
+            msg: >-
+              cilium-envoy is not listening on host port 80 on {{ inventory_hostname }}.
+              The cilium-agent did not reload enable-gateway-api — restart the
+              cilium and cilium-envoy DaemonSets.
+          when: "'HOST80_MISSING' in gw_host80.stdout"
 
         - name: Gateway test summary
           ansible.builtin.debug:

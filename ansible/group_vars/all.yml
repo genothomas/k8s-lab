@@ -2,6 +2,10 @@
 kubernetes_version: "1.36.5"
 kubernetes_patch_version: "1.36"
 
+# cri-tools version (provides crictl, the CRI client for containerd).
+# Tracks the Kubernetes minor: cri-tools 1.36.0 pairs with k8s 1.36.
+kubernetes_cri_tools_version: "{{ kubernetes_patch_version }}.0"
+
 container_runtime: containerd
 
 # External API endpoint fronted by HAProxy. Added to apiserver cert SANs.
@@ -38,3 +42,8 @@ kubernetes_kernel_modules:
 
 # ntfy topic includes env + name so dev/staging/prod route to own channels.
 alertmanager_webhook_url: "https://ntfy.sh/{{ kubernetes_environment }}-{{ cluster_name }}"
+
+# Grafana admin password. Read from the environment — the observability
+# tier puts Grafana on the public https listener, so the credential must
+# not live in the repo. The role fails fast when it is unset.
+grafana_admin_password: "{{ lookup('env', 'GRAFANA_ADMIN_PASSWORD') | default('', true) }}"

@@ -116,6 +116,28 @@ prometheus-node-exporter:
 # Watchdog, KubePodCrashLooping, KubeAPIDown, etc.
 defaultRules:
   enabled: true
+  groups:
+    # kube-prometheus-general.rules contains ONLY count:up0 and count:up1.
+    # count:up0 is `count(up == 0) without(instance,pod,node)` — when every
+    # scrape target is healthy, `up == 0` matches nothing, the expression
+    # returns an EMPTY vector, and the recording rule writes ZERO samples.
+    # vmalert's built-in RecordingRulesNoData alert then fires ("produces 0
+    # samples over the last 30min") precisely BECAUSE nothing is broken.
+    # Self-referential false positive.
+    #
+    # The chart renders its default rule groups from this map via
+    # templates/sync-job/config.yaml, and the sync job creates the matching
+    # VMRule objects. A group with `enabled: false` is skipped, so the
+    # VMRule is never created.
+    #
+    # Upstream chart 0.97.0 defaults this group to `enabled: false`; the
+    # pinned 0.95.0 does not, so it is set explicitly here. Helm deep-merges
+    # the group map, so the chart's own `rules: {}` default is preserved.
+    #
+    # The `up` metric itself comes from vmagent's scrape and is unaffected —
+    # these two recording rules feed nothing else.
+    kube-prometheus-general.rules:
+      enabled: false
 defaultDashboards:
   enabled: true
 # Chart's bundled VM datasource ships with isDefault: true, colliding with

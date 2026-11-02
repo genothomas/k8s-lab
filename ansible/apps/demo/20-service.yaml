@@ -12,6 +12,11 @@ spec:
     app.kubernetes.io/name: podinfo
     app.kubernetes.io/part-of: demo
   ports:
-    - protocol: TCP
+    # The port MUST be named: the podinfo VMServiceScrape selects this
+    # endpoint by Service port name ("port: http"), not by number. An
+    # unnamed port makes the scrape find zero targets and fires
+    # ScrapePoolHasNoTargets.
+    - name: http
+      protocol: TCP
       port: 80
       targetPort: http

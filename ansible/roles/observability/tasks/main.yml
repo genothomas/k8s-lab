@@ -2,6 +2,19 @@
 - name: Helm + namespace + install
   when: not ansible_check_mode
   block:
+    # Grafana ends up on the public https listener. A blank or default
+    # password there is a public admin console, so refuse to install.
+    - name: Require a Grafana admin password
+      ansible.builtin.assert:
+        that:
+          - grafana_admin_password | length > 0
+          - grafana_admin_password | length >= 12
+        fail_msg: >-
+          GRAFANA_ADMIN_PASSWORD is unset or too short. Export it
+          (12+ chars) before running the observability tier — the Grafana
+          console is published on the public https listener.
+        success_msg: "Grafana admin password supplied via the environment."
+
     - name: Create monitoring namespace
       ansible.builtin.shell:
         cmd: >-

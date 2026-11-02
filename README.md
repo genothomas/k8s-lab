@@ -52,6 +52,7 @@ Where to look first when something changes.
 | `terraform/variables.tf` | All input vars with defaults + descriptions. |
 | `terraform/main.tf` | Module wiring — network → firewall → vps → dns. |
 | `terraform/outputs.tf` | Includes `ansible_inventory_yaml` (consumed by `make inventory`). |
+| `terraform/dns-zone/` | Standalone root module — creates only the `<sub>.<zone>` + `*.<sub>.<zone>` Cloudflare A records, without the AWS side. |
 
 **Ansible**
 
@@ -81,6 +82,7 @@ Where to look first when something changes.
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | always | Or SSO/profile. |
 | `TF_VAR_cloudflare_api_token` | `enable_dns=true` | Passed to TF / Cloudflare provider. |
 | `CLOUDFLARE_API_TOKEN` | `make cert` when `enable_dns=true` | Make guard refuses to run cert phase if missing. |
+| `GRAFANA_ADMIN_PASSWORD` | `make observability` / `make local-observability` | Grafana admin password (12+ chars). Read by the playbook from the environment; never stored in the repo. The Make guard refuses to run the tier if it is missing. |
 
 ## Status
 
@@ -118,8 +120,37 @@ make local-test                # HTTP probes through edge-01
 make local-cleanup             # trim scratch/history/caches before snapshotting
 ```
 
+`make local-gateway` ends with a real check, not a status field: the Gateway
+reports `Programmed=True` even when the cilium-agent never reloaded
+`enable-gateway-api`, so the playbook fails unless `cilium-envoy` is actually
+listening on host port 80. Port 443 needs cert-manager (`make local-cert`),
+which is a separate step.
+
+### DNS in the local lab
+
+The lab's public hostname is `<dns_subdomain>.<dns_zone>` (currently
+`svc.dotunet.com`), with a wildcard for `grafana.`, `pod.` and `demo.`
+sub-hostnames. The A records point at the remote VPS (`152.67.31.10`), which
+DNATs `:443` to edge-01's WireGuard address.
+
+`terraform/dns-zone/` is a standalone root module that creates just those two
+records (the `dns` module in `terraform/dns/` is normally wired into the AWS
+root, which needs credentials this lab does not have):
+
+```bash
+export CLOUDFLARE_API_TOKEN=...        # zone-scoped, Zone:DNS:Edit
+terraform -chdir=terraform/dns-zone init
+terraform -chdir=terraform/dns-zone apply -auto-approve
+```
+
 `local-*` targets never depend on the `inventory` target — that one pipes
 Terraform output into the inventory file and would overwrite `local.yml`.
+
+After creating the A records, the exact name `<dns_subdomain>.<dns_zone>`
+keeps returning NXDOMAIN for up to 30 minutes (the zone's SOA minimum, 1800s)
+at any resolver that queried it before the record existed — RFC 2308 negative
+caching. The wildcard covers sub-hostnames immediately; the apex name appears
+once the negative entry expires. `terraform apply -replace` does not flush it.
 
 Two deviations from the AWS path, both driven by the smaller boxes:
 

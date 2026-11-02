@@ -11,11 +11,38 @@ spec:
     - name: web
       namespace: web
       sectionName: http
+  # Apex + wildcard suffix for every name the lab answers on.
+  #
+  # Gateway API spec: "Hostnames that are prefixed with a wildcard label
+  # (`*.`) are interpreted as a suffix match. That means that a match for
+  # `*.example.com` would match both `test.example.com`, and
+  # `foo.test.example.com`, but not `example.com`." So the wildcard covers
+  # demo. / grafana. / pod. / any future subdomain, but NOT the bare apex —
+  # that needs its own entry.
+  #
+  # A hostname list (rather than a catch-all with no `hostnames:`) keeps
+  # typos and the bare IP out: a request with Host: 152.67.31.10 matches
+  # nothing and gets a 404 instead of a redirect to an https URL that has no
+  # certificate. The Gateway API spec also forbids IPs as hostnames.
+  #
+  # Both the real zone and the nip.io alias are listed so plain HTTP works
+  # whichever name it is reached by. Note the LE certificate only covers
+  # <dns_subdomain>.<dns_zone> and *.<dns_subdomain>.<dns_zone> — the
+  # nip.io names redirect to an https URL with no matching certificate, so
+  # those land on a TLS error rather than a working page.
+  #
+  # The redirect keeps the original Host header (no `hostname` filter in
+  # requestRedirect), so http://demo.svc.<zone>/x becomes
+  # https://demo.svc.<zone>/x.
   hostnames:
 {% if enable_dns %}
     - "{{ dns_subdomain }}.{{ dns_zone }}"
+    - "*.{{ dns_subdomain }}.{{ dns_zone }}"
+    - "{{ nip_apex }}"
+    - "*.{{ nip_apex }}"
 {% else %}
     - "grafana.{{ nip_apex }}"
+    - "*.{{ nip_apex }}"
 {% endif %}
   rules:
     - filters:

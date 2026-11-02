@@ -38,15 +38,14 @@ all:
     kubernetes_pod_subnet: "10.42.0.0/16"
     kubernetes_service_subnet: "10.43.0.0/16"
 
-    # DNS-01 via Cloudflare. Replace dns_zone with the real zone before
-    # running the cert phase; the Makefile guard refuses to run it
-    # against the placeholder.
+    # DNS-01 via Cloudflare. Zone managed in Cloudflare; the A records
+    # <sub>.<zone> and *.<sub>.<zone> point at the remote VPS.
     enable_dns: true
-    dns_zone: "REPLACE_WITH_REAL_ZONE"
+    dns_zone: "dotunet.com"
     dns_subdomain: "svc"
     # Public IP of the remote VPS — the address the internet sees.
     nip_apex: "152-67-31-10.nip.io"
-    cert_letsencrypt_email: "ops@REPLACE_WITH_REAL_ZONE"
+    cert_letsencrypt_email: "ops@dotunet.com"
 
     # The edge NAT path is hand-built (WireGuard + policy routing); the
     # AWS-flavoured nat role would MASQUERADE the wrong subnet and bake
