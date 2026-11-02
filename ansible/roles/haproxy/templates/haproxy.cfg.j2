@@ -24,6 +24,14 @@ backend k8s-api
 {% endfor %}
 
 # ---- HTTP (TCP 80) — passed to Envoy Gateway ----
+# When gateway_proxy_protocol is on, the backend connections carry a PROXY
+# protocol v2 header with the real client address (the edge preserves the
+# source IP of the VPS-DNATed connection). Cilium's Gateway listeners then
+# reject anything without that header.
+#
+# check-send-proxy is required, not cosmetic: `send-proxy-v2` only affects
+# forwarded traffic. Health-check connections are separate, and HAProxy
+# sends the PROXY header on them only when check-send-proxy is set.
 frontend k8s-http
     bind *:{{ haproxy_http_port }}
     default_backend k8s-http
@@ -31,7 +39,8 @@ frontend k8s-http
 backend k8s-http
     balance roundrobin
 {% for host in groups['control_plane'] %}
-    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_http_port }} check
+    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_http_port }} check{% if gateway_proxy_protocol | default(false) %} send-proxy-v2 check-send-proxy{% endif %}
+
 {% endfor %}
 
 # ---- HTTPS (TCP 443) — passed to Envoy Gateway ----
@@ -42,7 +51,8 @@ frontend k8s-https
 backend k8s-https
     balance roundrobin
 {% for host in groups['control_plane'] %}
-    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_https_port }} check
+    server {{ host }} {{ hostvars[host].ansible_host | default(host) }}:{{ haproxy_https_port }} check{% if gateway_proxy_protocol | default(false) %} send-proxy-v2 check-send-proxy{% endif %}
+
 {% endfor %}
 
 # ---- Stats dashboard (optional) ----

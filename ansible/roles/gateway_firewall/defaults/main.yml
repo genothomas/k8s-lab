@@ -1,0 +1,25 @@
+---
+# Node-side access control for the Cilium Gateway API listeners.
+#
+# Only the edge HAProxy may reach a node's Gateway listener ports. The
+# PROXY protocol header carries the client address and is NOT
+# authenticated, so every other source has to be locked out — otherwise
+# anyone on the LAN (or any pod) can claim an arbitrary client IP in the
+# Envoy access log.
+
+# The edge box. Its HAProxy is the only supported ingress path.
+gateway_firewall_edge_ip: "{{ edge_public_ip }}"
+
+# Ports where the Cilium Gateway listeners bind (host network).
+gateway_firewall_listener_ports:
+  - 80
+  - 443
+
+# NodePorts of the Cilium-managed Gateway Service. They are an alternative
+# path to the same PROXY-required listeners, so they are closed as well.
+gateway_firewall_nodeports:
+  - 32422
+  - 31220
+
+# Dedicated chain, jumped to from INPUT.
+gateway_firewall_chain: K8SGW

@@ -18,7 +18,7 @@ WAIT_TIMEOUT  ?= 360
 WAIT_INTERVAL ?= 10
 
 .PHONY: all help check ping terraform inventory bootstrap k8s cni gateway cert observability demo haproxy clean destroy nuke wait-ready test \
-        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-cert local-observability local-demo local-test local-cleanup local-cleanup-snapshot local-all
+        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-gateway-proxy local-cert local-observability local-demo local-test local-cleanup local-cleanup-snapshot local-all
 
 .DEFAULT_GOAL := check
 
@@ -163,6 +163,12 @@ local-cluster: local-check
 local-gateway: local-check
 	$(LOCAL_ANS) ansible/playbooks/cluster-gateway.yml
 
+# PROXY protocol v2 cutover between the edge HAProxy and the Cilium
+# Gateway listeners. Coordinated: firewall -> Cilium -> edge reload.
+# Brief outage while the two sides are incompatible.
+local-gateway-proxy: local-check
+	$(LOCAL_ANS) ansible/playbooks/gateway-proxy-protocol.yml
+
 # DNS-01 via Cloudflare: needs a real zone in the inventory AND the token
 # in the environment. The token is written straight into a cert-manager
 # Secret — it is never stored in the repo.
@@ -264,6 +270,7 @@ help:
 	@echo "  local-k8s           - kubernetes.yml (containerd + kubelet)"
 	@echo "  local-cluster       - cluster.yml (kubeadm init, Cilium, joins)"
 	@echo "  local-gateway       - cluster-gateway.yml (Gateway API + web Gateway)"
+	@echo "  local-gateway-proxy - gateway-proxy-protocol.yml (PROXY v2 cutover, brief outage)"
 	@echo "  local-cert          - cluster-cert.yml (cert-manager + LE, needs CLOUDFLARE_API_TOKEN)"
 	@echo "  local-observability - cluster-observability.yml (VictoriaMetrics stack)"
 	@echo "  local-demo          - cluster-demo.yml (podinfo demo)"

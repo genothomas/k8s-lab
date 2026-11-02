@@ -1,0 +1,93 @@
+---
+# Restrict the Cilium Gateway API listeners on the control-plane nodes to
+# the edge HAProxy.
+#
+# Cilium's gatewayAPI.enableProxyProtocol installs Envoy's PROXY-protocol
+# listener filter with allow_requests_without_proxy_protocol unset (false),
+# so connections without a PROXY header are rejected. The PROXY header is
+# unauthenticated: anyone able to reach a node's :80/:443 could forge an
+# arbitrary client address into the access log. Only the edge may connect.
+#
+# Rules live in a dedicated chain jumped to from INPUT, so the rest of the
+# node's INPUT chain stays untouched and the whole rule set is removable
+# by deleting one chain.
+#
+# Note: the Kubernetes API port (6443) is deliberately not touched.
+
+- name: Configure the Gateway listener firewall
+  when: gateway_proxy_protocol | bool
+  block:
+    - name: Preseed iptables-persistent to save current rules on install (non-interactive)
+      ansible.builtin.debconf:
+        name: "iptables-persistent"
+        question: "{{ item.question }}"
+        value: "{{ item.value }}"
+        vtype: "{{ item.vtype }}"
+      loop:
+        - { question: "iptables-persistent/autosave_v4", value: "true", vtype: "boolean" }
+        - { question: "iptables-persistent/autosave_v6", value: "false", vtype: "boolean" }
+
+    - name: Create the {{ gateway_firewall_chain }} chain
+      ansible.builtin.iptables:
+        chain: "{{ gateway_firewall_chain }}"
+        state: present
+
+    - name: Jump to the {{ gateway_firewall_chain }} chain from INPUT
+      ansible.builtin.iptables:
+        chain: INPUT
+        jump: "{{ gateway_firewall_chain }}"
+        insert: true
+        position: "1"
+        comment: "k8s-lab: Gateway listener access control"
+
+    - name: Allow the edge HAProxy to reach the Gateway listeners
+      ansible.builtin.iptables:
+        chain: "{{ gateway_firewall_chain }}"
+        source: "{{ gateway_firewall_edge_ip }}"
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+        comment: "k8s-lab: edge HAProxy -> Gateway listener"
+      loop: "{{ gateway_firewall_listener_ports }}"
+
+    - name: Allow the node itself to reach the Gateway listeners
+      ansible.builtin.iptables:
+        chain: "{{ gateway_firewall_chain }}"
+        source: "127.0.0.1"
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+        comment: "k8s-lab: loopback -> Gateway listener"
+      loop: "{{ gateway_firewall_listener_ports }}"
+
+    - name: Drop every other connection to the Gateway listeners
+      ansible.builtin.iptables:
+        chain: "{{ gateway_firewall_chain }}"
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: DROP
+        comment: "k8s-lab: PROXY protocol is unauthenticated - edge only"
+      loop: "{{ gateway_firewall_listener_ports }}"
+
+    - name: Drop the Gateway Service NodePorts
+      ansible.builtin.iptables:
+        chain: "{{ gateway_firewall_chain }}"
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: DROP
+        comment: "k8s-lab: NodePort path to the PROXY-required listener"
+      loop: "{{ gateway_firewall_nodeports }}"
+
+    - name: Install iptables-persistent
+      ansible.builtin.apt:
+        name: iptables-persistent
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Persist iptables rules across reboot
+      ansible.builtin.command:
+        cmd: netfilter-persistent save
+      changed_when: true

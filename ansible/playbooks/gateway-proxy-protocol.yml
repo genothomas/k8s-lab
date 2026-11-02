@@ -1,0 +1,139 @@
+---
+# PROXY protocol v2 cutover: edge HAProxy <-> Cilium Gateway API listeners.
+#
+# WHY
+#   Edge HAProxy runs `mode tcp`, so it re-originates the connection to the
+#   nodes with the edge's own source IP (192.168.16.30). The original client
+#   address is destroyed before Cilium ever sees it — every access-log line
+#   showed the edge box as the client. PROXY protocol v2 carries the real
+#   address in a header, so the log shows the actual public client.
+#   (The VPS DNAT preserves the source IP, so the address HAProxy sees — and
+#   therefore the one in the PROXY header — is the real client.)
+#
+# ORDER MATTERS
+#   The two sides are incompatible during the transition:
+#     HAProxy plain TCP + Cilium PROXY required -> rejected
+#     HAProxy PROXY v2  + Cilium plain         -> rejected
+#   There is no ordering that avoids a mismatch window. Cilium goes FIRST
+#   because the helm upgrade + operator rollout is the slow step; the edge
+#   reload happens last, so the outage window is only the gap between the
+#   operator becoming ready and the HAProxy reload.
+#
+# ROLLBACK
+#   Set `gateway_proxy_protocol: false` in ansible/group_vars/all.yml and
+#   re-run this playbook. The HAProxy template drops send-proxy-v2 and the
+#   Cilium overrides drop the listener filter — both flip back together.
+#   Remove the node firewall at the same time (the role is gated on the
+#   same variable, so it is skipped, but the chain stays until the rules
+#   are removed explicitly — see README).
+
+- name: Restrict the Gateway listeners to the edge
+  hosts: control_plane
+  become: true
+  roles:
+    - gateway_firewall
+
+# Cilium side first: helm upgrade + operator restart regenerate the CEC,
+# which installs Envoy's proxy_protocol listener filter.
+# (cluster-gateway.yml also applies the gateway_firewall role — it is
+# idempotent, and keeps `make local-gateway` in sync on a fresh install.)
+- import_playbook: cluster-gateway.yml
+
+# Edge side last: this is the moment traffic starts flowing again.
+- name: Enable PROXY protocol on the edge HAProxy backends
+  hosts: edge
+  become: true
+  roles:
+    - haproxy
+
+- name: Verify the cutover from the edge
+  hosts: edge
+  become: true
+  tasks:
+    - name: Fetch the HAProxy statistics
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ haproxy_stats_port }}/stats;csv"
+        return_content: true
+      register: haproxy_stats
+      retries: 10
+      delay: 3
+      until: haproxy_stats is succeeded
+      changed_when: false
+
+    - name: Show the Gateway backend states
+      ansible.builtin.debug:
+        msg: >-
+          {{ haproxy_stats.content.split('\n')
+             | select('search', 'k8s-http|k8s-https')
+             | select('search', 'master|node1|node2')
+             | list }}
+
+    - name: Request the demo app over the public path
+      ansible.builtin.uri:
+        url: "https://demo.svc.dotunet.com/"
+        status_code: 200
+        return_content: false
+      register: public_request
+      retries: 5
+      delay: 5
+      until: public_request is succeeded
+      changed_when: false
+
+    - name: Confirm the public request succeeded
+      ansible.builtin.debug:
+        msg: "public request status={{ public_request.status }}"
+
+- name: Verify the cutover from the cluster
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Confirm the Cilium proxy-protocol flag
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n kube-system get cm cilium-config
+          -o jsonpath='{.data.enable-gateway-api-proxy-protocol}{"\n"}'
+      register: proxy_protocol_flag
+      changed_when: false
+
+    - name: Print the Cilium proxy-protocol flag
+      ansible.builtin.debug:
+        msg: "enable-gateway-api-proxy-protocol={{ proxy_protocol_flag.stdout }}"
+
+    - name: Fail when the proxy-protocol listener filter is not active
+      ansible.builtin.fail:
+        msg: >-
+          Cilium is not enforcing PROXY protocol — expected
+          enable-gateway-api-proxy-protocol="true". The edge HAProxy is now
+          sending PROXY headers that Envoy would reject.
+      when: proxy_protocol_flag.stdout.strip() != 'true'
+
+    - name: Read the recent Envoy access log
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n kube-system logs
+          -l k8s-app=cilium-envoy --all-containers --tail=200 --prefix
+      register: envoy_logs
+      changed_when: false
+
+    - name: Collect the logged client addresses
+      ansible.builtin.set_fact:
+        envoy_client_lines: >-
+          {{ envoy_logs.stdout_lines | select('search', 'remote_address') | list }}
+
+    - name: Show the client addresses Envoy logged
+      ansible.builtin.debug:
+        msg: >-
+          {{ envoy_client_lines | last | default('(no access-log lines)') }}
+
+    - name: Fail when every logged client is still the edge box
+      ansible.builtin.fail:
+        msg: >-
+          Every access-log line still shows 192.168.16.30 as the client. The
+          PROXY header is not reaching Envoy — check the HAProxy config and
+          the operator rollout.
+      when: >-
+        envoy_client_lines | length > 0
+        and (envoy_client_lines | select('search', '192.168.16.30') | list | length)
+        == (envoy_client_lines | length)

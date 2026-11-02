@@ -1,4 +1,14 @@
 ---
+# Restrict the Gateway listeners to the edge BEFORE Cilium starts
+# requiring PROXY protocol. The PROXY header carries the client address
+# and is not authenticated, so every other source has to be locked out.
+# Skipped automatically when gateway_proxy_protocol is false.
+- name: Restrict the Gateway listeners to the edge
+  hosts: control_plane
+  become: true
+  roles:
+    - gateway_firewall
+
 - name: Migrate Cilium to Gateway API
   hosts: node-01
   become: true
@@ -175,6 +185,17 @@
         group: ubuntu
         mode: "0644"
 
+    # Envoy access logs for every Gateway on the `cilium` GatewayClass.
+    # The CRD ships with Cilium 1.20.2; the Gateway API CRDs (v1.6.2)
+    # support GatewayClass.spec.parametersRef.
+    - name: Render CiliumGatewayClassConfig (Envoy access logs)
+      ansible.builtin.template:
+        src: ../apps/web/70-gateway-access-logs.yaml.j2
+        dest: "{{ web_dir }}/70-gateway-access-logs.yaml"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
     - name: Apply + verify
       when: not ansible_check_mode
       block:
@@ -190,6 +211,42 @@
 
         - name: Print apply result
           ansible.builtin.debug: { var: gw_apply.stdout_lines }
+
+        - name: Apply CiliumGatewayClassConfig (Envoy access logs)
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} apply
+              -f {{ web_dir }}/70-gateway-access-logs.yaml
+          register: cgcc_apply
+          changed_when: "'configured' in cgcc_apply.stdout or 'created' in cgcc_apply.stdout"
+
+        - name: Print CiliumGatewayClassConfig apply result
+          ansible.builtin.debug: { var: cgcc_apply.stdout_lines }
+
+        # The GatewayClass `cilium` is owned by the cilium Helm release and
+        # the chart has no value for parametersRef, so `helm upgrade cilium`
+        # (the upgrade above, and any future one) wipes the reference. The
+        # patch has to come AFTER the upgrade — hence it lives here and not
+        # in the chart values.
+        - name: Reference the access-log config from the GatewayClass
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} patch gatewayclass cilium
+              --type=merge
+              -p '{"spec":{"parametersRef":{"group":"cilium.io","kind":"CiliumGatewayClassConfig","name":"gateway-access-logs","namespace":"kube-system"}}}'
+          register: gwclass_patch
+          changed_when: "'patched' in gwclass_patch.stdout"
+
+        - name: Show GatewayClass parametersRef + conditions
+          ansible.builtin.command:
+            cmd: >-
+              kubectl --kubeconfig={{ kubeconfig }} get gatewayclass cilium
+              -o jsonpath='{.spec.parametersRef}{"\n"}{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'
+          register: gwclass_params
+          changed_when: false
+
+        - name: Print GatewayClass parametersRef + conditions
+          ansible.builtin.debug: { var: gwclass_params.stdout_lines }
 
         - name: Show cilium pods
           ansible.builtin.command:
@@ -239,3 +296,7 @@
                 - cilium-envoy bound host 80/443 (ADDRESS column populated)
                 - HTTPRoute `redirect` (web ns) returns 301 from any Host on :80
                 - HTTPRoute(s) attached via cluster-cert.yml + cluster-observability.yml
+                - GatewayClass `cilium` parametersRef points at
+                  CiliumGatewayClassConfig/gateway-access-logs, and Envoy
+                  access logs appear on:
+                  kubectl -n kube-system logs ds/cilium-envoy -f --prefix

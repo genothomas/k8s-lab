@@ -24,3 +24,30 @@ hubble:
 tls:
   secretSync:
     enabled: false
+{% if gateway_proxy_protocol | default(false) %}
+# Gateway API + PROXY protocol v2.
+#
+# The edge HAProxy tunnels to the nodes' :80/:443 and prepends a PROXY v2
+# header carrying the original client address (the VPS DNAT preserves the
+# source IP, so the address in the header is the real public client).
+# Without this the Envoy access log only ever shows the edge box
+# (192.168.16.30) as the client.
+#
+# enableProxyProtocol is an OPERATOR-GLOBAL flag, not per-Gateway: Cilium
+# installs Envoy's proxy_protocol listener filter on every Gateway API
+# listener, and the filter is created with allow_requests_without_proxy_protocol
+# unset (i.e. false). Consequences:
+#   * only connections carrying a PROXY header are accepted;
+#   * ClusterIP, NodePort and direct-node access to the Gateway all fail;
+#   * the PROXY header is NOT authenticated — anything able to reach a
+#     node's :80/:443 can forge a client IP. Hence the gateway_firewall
+#     role restricts those ports to the edge.
+#
+# useRemoteAddress / xffNumTrustedHops keep Envoy appending the (now real)
+# downstream address to X-Forwarded-For and treating the right-most entry as
+# authoritative, so a client-supplied X-Forwarded-For cannot win.
+gatewayAPI:
+  enableProxyProtocol: true
+  useRemoteAddress: true
+  xffNumTrustedHops: 0
+{% endif %}

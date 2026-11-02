@@ -1,0 +1,67 @@
+---
+# Envoy access logs for every Gateway that uses the `cilium` GatewayClass.
+#
+# CiliumGatewayClassConfig is an alpha API (cilium.io/v2alpha1), but the
+# CRD ships with Cilium 1.20.2 and the installed Gateway API CRDs
+# (v1.6.2) support GatewayClass.spec.parametersRef, so no chart or CNI
+# upgrade is needed.
+#
+# Logs land on the cilium-envoy pods' stdout:
+#   kubectl -n kube-system logs ds/cilium-envoy -f --prefix
+#
+# The GatewayClass `cilium` is owned by the cilium Helm release and the
+# chart exposes no value for parametersRef, so the reference has to be
+# patched back after every `helm upgrade cilium`. cluster-gateway.yml does
+# that right after its own upgrade — that is why the patch lives in the
+# playbook and not in a values file.
+apiVersion: cilium.io/v2alpha1
+kind: CiliumGatewayClassConfig
+metadata:
+  name: gateway-access-logs
+  namespace: {{ cilium_namespace }}
+  labels:
+    app.kubernetes.io/part-of: gateway
+spec:
+  telemetry:
+    accessLogs:
+      # format is required. JSON keeps the fields queryable once the
+      # output is shipped to Loki/Vector; Text is the nginx-ish default.
+      - format: JSON
+        # HTTP connection managers only (the default). TCP would add the
+        # TLS-passthrough proxies, which this lab does not run.
+        targets:
+          - HTTP
+        # Field name -> Envoy command operator. Supplying `json` replaces
+        # the CRD's default field set entirely, so it is spelled out here.
+        json:
+          start_time: '%START_TIME%'
+          gateway: '%CILIUM_GATEWAY_NAME%'
+          gateway_namespace: '%CILIUM_GATEWAY_NAMESPACE%'
+          method: '%REQUEST_HEADER(:METHOD)%'
+          host: '%REQUEST_HEADER(:AUTHORITY)%'
+          path: '%REQUEST_HEADER(X-ENVOY-ORIGINAL-PATH?:PATH)%'
+          protocol: '%PROTOCOL%'
+          status: '%RESPONSE_CODE%'
+          duration_ms: '%DURATION%'
+          upstream_time_ms: '%RESPONSE_HEADER(X-ENVOY-UPSTREAM-SERVICE-TIME)%'
+          upstream_host: '%UPSTREAM_HOST%'
+          response_flags: '%RESPONSE_FLAGS%'
+          bytes_received: '%BYTES_RECEIVED%'
+          bytes_sent: '%BYTES_SENT%'
+          # The address Envoy sees the connection coming from. The edge
+          # HAProxy runs `mode tcp` (pure TCP tunnel, adds no XFF header), so
+          # this is the edge box, not the original client. Without it the log
+          # carries no peer address at all.
+          remote_address: '%DOWNSTREAM_REMOTE_ADDRESS%'
+          # SNI as sent by the client — empty for plaintext HTTP.
+          sni: '%REQUESTED_SERVER_NAME%'
+          # Which Envoy cluster served the request.
+          upstream_cluster: '%UPSTREAM_CLUSTER%'
+          user_agent: '%REQUEST_HEADER(USER-AGENT)%'
+          x_forwarded_for: '%REQUEST_HEADER(X-FORWARDED-FOR)%'
+          # Envoy's own trusted-client view. It is set ONLY for external
+          # requests: with use_remote_address enabled a request counts as
+          # internal when it carries no XFF and the downstream source is
+          # RFC1918 — so this stays null for in-cluster callers and is
+          # populated for public ones.
+          x_envoy_external_address: '%REQUEST_HEADER(X-ENVOY-EXTERNAL-ADDRESS)%'

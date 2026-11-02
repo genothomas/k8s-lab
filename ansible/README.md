@@ -119,6 +119,256 @@ Port 443 stays closed until cert-manager issues the `web-tls` Secret — the
 HTTPS listener reports `InvalidCertificateRef` and is not programmed without
 it.
 
+### Envoy access logs (`CiliumGatewayClassConfig`)
+
+Per-request access logs for every Gateway on the `cilium` GatewayClass —
+no extra proxy, no CNI upgrade. Cilium 1.20.2 already ships the
+`CiliumGatewayClassConfig` CRD (`cilium.io/v2alpha1`), and the installed
+Gateway API CRDs (v1.6.2) support `GatewayClass.spec.parametersRef`.
+
+`apps/web/70-gateway-access-logs.yaml.j2` holds the config:
+
+```yaml
+spec:
+  telemetry:
+    accessLogs:
+      - format: JSON
+        targets: [HTTP]
+        json:
+          start_time: '%START_TIME%'
+          gateway: '%CILIUM_GATEWAY_NAME%'
+          method: '%REQUEST_HEADER(:METHOD)%'
+          host: '%REQUEST_HEADER(:AUTHORITY)%'
+          path: '%REQUEST_HEADER(X-ENVOY-ORIGINAL-PATH?:PATH)%'
+          status: '%RESPONSE_CODE%'
+          duration_ms: '%DURATION%'
+          ...
+```
+
+Read them with:
+
+```bash
+kubectl -n kube-system logs -l k8s-app=cilium-envoy --all-containers -f --prefix
+```
+
+**Use the label selector, not `ds/cilium-envoy`.** `kubectl logs ds/...` prints
+`Found 3 pods, using pod/cilium-envoy-vnsdl` and silently shows only ONE pod's
+logs. The edge HAProxy round-robins across node-01/02/03, so a request can
+land on any of the three — you will "lose" most requests.
+
+Verified live (2026-11-02) — a request to the gateway produced:
+
+```json
+{"bytes_received":0,"bytes_sent":0,"duration_ms":7,"gateway":"web","gateway_namespace":"web",
+ "host":"demo.svc.dotunet.com","method":"GET","path":"/","protocol":"HTTP/1.1",
+ "remote_address":"10.42.0.74:50608","response_flags":"-","sni":null,
+ "start_time":"2026-11-02T07:47:33.287Z","status":301,"upstream_cluster":null,
+ "upstream_host":null,"upstream_time_ms":null,"user_agent":"curl/8.11.1",
+ "x_forwarded_for":"10.42.0.74"}
+```
+
+`upstream_host` / `upstream_cluster` / `upstream_time_ms` are `null` for a
+redirect: the request never reached a backend, so Envoy has no upstream to
+report. A routed request to podinfo fills them in.
+
+### Testing the access logs from the client side
+
+The public path is: DNS `*.svc.dotunet.com` → VPS `152.67.31.10` → DNAT :443
+→ edge-01 HAProxy → node `:443` → cilium-envoy → Gateway listener → HTTPRoute.
+
+```bash
+# 1. HTTP → HTTPS redirect (the `redirect` HTTPRoute is on the `http` listener)
+curl -v -I http://demo.svc.dotunet.com/     # expect 301 → https://demo.svc.dotunet.com:443/
+
+# 2. Real app over TLS (cert SAN is *.svc.dotunet.com, so verification passes)
+curl -v https://demo.svc.dotunet.com/        # expect 200 podinfo
+curl -v https://grafana.svc.dotunet.com/     # grafana
+
+# 3. Negative cases
+curl -v -I http://typo.example.com/          # 404, no matching host
+curl -v -k https://152-67-31-10.nip.io/      # cert mismatch → -k (host route exists)
+
+# 4. Watch the logs while you curl
+kubectl -n kube-system logs -l k8s-app=cilium-envoy --all-containers -f --prefix
+```
+
+Two things that bite here:
+
+- **The client IP is flattened at the edge — in exactly one hop.** Measured on
+  the running lab (2026-11-02):
+  - On edge-01, the established socket on `:443` shows the **real public
+    client** as peer (e.g. `103.189.143.226:6266`). The VPS DNATs `:443` to
+    the edge and **preserves the source IP** — no proxying happens there.
+  - Envoy on the nodes logs `"remote_address":"192.168.16.30:<port>"` for every
+    internet request, and `x_forwarded_for` is the same single value.
+  - Cause: edge HAProxy runs `mode tcp` (pure TCP tunnel — it opens a *new*
+    connection to the node with the edge's own source IP and adds no
+    `X-Forwarded-For` header). The original client address is therefore gone
+    before Cilium ever sees it.
+  - XFF trust semantics, verified by spoofing `X-Forwarded-For: 9.9.9.9` from
+    a pod: Envoy logged `"9.9.9.9,10.42.0.34"` — it **appends** the TCP peer
+    and keeps the right-most entry authoritative. With `useRemoteAddress:
+    true` + `xffNumTrustedHops: 0` the client IP is *not* spoofable.
+  - Fixing it means fixing the edge, not Cilium: **PROXY protocol v2 end to
+    end** — HAProxy `server ... send-proxy-v2` on the node backends plus
+    `gatewayAPI.enableProxyProtocol: true`. See "Client IP: PROXY protocol v2"
+    below.
+- **Public traffic lands on the `https` listener, so it 404s on the apex
+  host.** The VPS DNATs only :443, and the `redirect` HTTPRoute is attached to
+  `sectionName: http`. A request for `https://svc.dotunet.com/` therefore
+  reaches the `https` listener, where no route matches that host → 404 with
+  `response_flags: NR`. Only `demo.` / `pod.` / `grafana.` sub-hosts are routed
+  on `https`. The redirect only fires for traffic that actually reaches :80.
+
+### Client IP: PROXY protocol v2
+
+`gateway_proxy_protocol: true` (in `ansible/group_vars/all.yml`) turns on the
+PROXY protocol between the edge HAProxy and the Cilium Gateway listeners, so
+the access log shows the real client instead of `192.168.16.30`.
+
+```
+client ──▶ VPS 152.67.31.10 (DNAT, source preserved)
+        ──▶ edge-01 :443 (HAProxy, peer = real client)
+        ──▶ PROXY v2 header ──▶ node :443 ──▶ cilium-envoy
+```
+
+**How each side is configured**
+
+| Side | Setting | Where |
+|------|---------|-------|
+| Edge HAProxy | `server … check send-proxy-v2 check-send-proxy` | `roles/haproxy/templates/haproxy.cfg.j2` |
+| Cilium | `gatewayAPI.enableProxyProtocol: true` | `roles/cni/templates/cilium-overrides.yaml.j2` |
+| Nodes | only `192.168.16.30` may reach `:80`/`:443` | `roles/gateway_firewall/` |
+
+`check-send-proxy` is **required**, not cosmetic: `send-proxy-v2` only affects
+forwarded traffic — health-check connections are separate, and HAProxy only
+puts the PROXY header on them when `check-send-proxy` is set. Without it the
+check connection arrives without a header and Envoy closes it.
+
+**What PROXY protocol costs**
+
+- Cilium's `gatewayAPI.enableProxyProtocol` is **operator-global**, not
+  per-Gateway. It installs Envoy's `proxy_protocol` listener filter with
+  `allow_requests_without_proxy_protocol` unset (i.e. false), so **only
+  connections carrying a PROXY header are accepted**. Consequences:
+  - ClusterIP, NodePort and direct-node access to the Gateway **stop working**
+    (the in-cluster probe recipe below is dead — use the edge instead);
+  - it applies to every Gateway listener in the cluster, not just the web one;
+  - the PROXY header is **not authenticated** — anything that can reach a
+    node's `:80`/`:443` can forge a client IP. Hence the `gateway_firewall`
+    role, which drops everything except the edge.
+- The Kubernetes API port (6443) is untouched — the API backends keep plain
+  TCP.
+
+**Cutover**
+
+```bash
+make local-gateway-proxy     # firewall → Cilium → edge HAProxy reload
+```
+
+The two sides are incompatible during the transition (PROXY-required vs.
+plain TCP), so there is a short outage. Cilium goes first because the helm
+upgrade + operator rollout is the slow step; the edge reload happens last, so
+the outage is only the gap between the operator becoming ready and the reload.
+
+**Rollback**
+
+```bash
+# set gateway_proxy_protocol: false in ansible/group_vars/all.yml
+make local-gateway-proxy
+```
+
+That drops `send-proxy-v2` on the edge and the listener filter in Cilium
+together. The node firewall rules are gated on the same variable and stay
+installed until the chain is removed explicitly
+(`iptables -D INPUT -j K8SGW && iptables -F K8SGW && iptables -X K8SGW`).
+
+**Diagnostics after the cutover**
+
+In-cluster access is closed, so probe from the edge:
+
+```bash
+# from edge-01 — direct to a node, hand-crafted PROXY v1 header
+printf 'PROXY TCP4 203.0.113.9 192.168.16.25 40000 80\r\nGET / HTTP/1.1\r\nHost: demo.svc.dotunet.com\r\n\r\n' \
+  | nc 192.168.16.25 80
+
+# from edge-01 — through the public path, exactly what a real client does
+curl -v https://demo.svc.dotunet.com/
+```
+
+A direct connection from another node must fail:
+
+```bash
+# from node-02 — no PROXY header, and the firewall drops it anyway
+nc -zv 192.168.16.25 443     # expect: refused / timeout
+```
+
+To generate in-cluster traffic without a workstation curl, run a throwaway
+one-shot pod (image `curlimages/curl:8.11.1` from Docker Hub) against the
+gateway Service with an explicit `Host` header — **only while PROXY protocol is
+off**:
+
+```bash
+kubectl -n default run accesslog-probe --image=curlimages/curl:8.11.1 \
+  --restart=Never --labels=probe=accesslog -- \
+  curl -sS -o /dev/null -w "HTTP=%{http_code} REDIR=%{redirect_url}\n" \
+  -H "Host: demo.svc.dotunet.com" \
+  http://cilium-gateway-web.web.svc.cluster.local/
+kubectl -n default logs accesslog-probe
+kubectl -n default delete pod accesslog-probe --ignore-not-found
+```
+
+Note: the gateway Service (`cilium-gateway-web`) has **no selector** — Cilium
+manages its endpoints itself — so the apiserver's service proxy
+(`/api/v1/namespaces/web/services/cilium-gateway-web:80/proxy/`) returns
+`NotFound`. Use the probe pod (or an external client) to reach it.
+
+Things that are easy to get wrong:
+
+- **`spec.telemetry.accessLogs` is a list**, not a map — `format` is required
+  (`JSON` or `Text`), and `json` maps field name → Envoy command operator.
+  Supplying `json` **replaces** the CRD's default field set, so the fields
+  are spelled out in full. That also means an invalid operator invalidates the
+  whole config (`status.conditions` → `Accepted=False`) and access logging
+  stops entirely until it is fixed.
+- **The GatewayClass is Helm-owned.** `cilium` carries
+  `meta.helm.sh/release-name: cilium`, and chart 1.20.2 has no value for
+  `parametersRef` (its `gatewayAPI` block only has `enabled`,
+  `enableProxyProtocol`, `useRemoteAddress`, `enableAppProtocol`,
+  `enableAlpn`, `xffNumTrustedHops`, `externalTrafficPolicy`,
+  `gatewayClass.create`, `secretsNamespace`, `hostNetwork`). Every
+  `helm upgrade cilium` therefore **wipes** `spec.parametersRef`. The
+  playbook patches it back *after* its own upgrade — which is why the patch
+  lives in `cluster-gateway.yml` and not in a values file.
+- **Logs go to Envoy stdout**, i.e. the `cilium-envoy` DaemonSet pods (this
+  cluster runs `external-envoy-proxy: "true"`, the dedicated Envoy
+  DaemonSet; the embedded-proxy variant would log to `ds/cilium` instead).
+  Pod logs are ephemeral — ship them to Loki/Vector if they must survive a
+  restart.
+- **`cilium-config`'s `envoy-access-log-enabled` is a different knob.** It
+  governs the *embedded* L7 proxy's own access log, not the Envoy Gateway.
+  With `external-envoy-proxy: "true"` the Gateway logs come from the
+  `cilium-envoy` DaemonSet and from the `CiliumGatewayClassConfig` alone.
+
+### What the live cluster actually receives
+
+Measured over the access logs on 2026-11-02 (all three envoy pods, ~37 lines
+in a few minutes of the lab being publicly reachable):
+
+```
+status: {404: 36, 301: 1}
+hosts:  {'svc.dotunet.com': 35, '152.67.31.10:80': 1, 'demo.svc.dotunet.com': 1}
+```
+
+The 35 requests to `svc.dotunet.com` are internet scanners
+(`/firebase-adminsdk.json`, `/firebase-key.json`, …) hitting the public apex
+name. They arrive on the `https` listener and get **404** (`response_flags: NR`
+= no route), because the `redirect` HTTPRoute is bound to `sectionName: http`
+and the VPS DNATs only :443. So the redirect rule is effectively dead for
+public traffic — it only fires for requests that reach node `:80` directly.
+If the redirect is meant to protect the public apex, either attach it to the
+`https` listener too or DNAT :80 as well.
+
 
 ## Inventory
 

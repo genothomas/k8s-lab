@@ -21,6 +21,18 @@ haproxy_http_port: 80
 haproxy_https_port: 443
 haproxy_stats_port: 8404
 
+# PROXY protocol v2 between the edge HAProxy and the Cilium Gateway API
+# listeners. Cilium's gatewayAPI.enableProxyProtocol is operator-GLOBAL:
+# once enabled, every Gateway listener rejects connections without a PROXY
+# header, so ClusterIP / NodePort / direct-node access to the Gateway all
+# stop working. The edge HAProxy is the only supported ingress.
+#
+# Rollback: set this to false and re-run
+#   ansible/playbooks/gateway-proxy-protocol.yml
+# Both sides flip back together (HAProxy drops send-proxy-v2, Cilium drops
+# the listener filter).
+gateway_proxy_protocol: true
+
 # Network ranges sourced from terraform via inventory all.vars.
 
 common_packages:
