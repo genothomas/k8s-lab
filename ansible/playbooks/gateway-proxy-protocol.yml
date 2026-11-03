@@ -39,6 +39,9 @@
 # idempotent, and keeps `make local-gateway` in sync on a fresh install.)
 - import_playbook: cluster-gateway.yml
 
+# The Cilium rollout above (in cluster-gateway.yml) ends with a firewall
+# re-assert, so the K8SGW jump is already back in first position here.
+
 # Edge side last: this is the moment traffic starts flowing again.
 - name: Enable PROXY protocol on the edge HAProxy backends
   hosts: edge

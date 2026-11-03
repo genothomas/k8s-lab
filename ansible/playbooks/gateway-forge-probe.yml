@@ -1,0 +1,290 @@
+---
+# Probe whether an in-cluster client can forge a client IP in the Gateway
+# access log, and characterise the path the traffic takes.
+#
+# Three connections are made from one throwaway pod, all against the
+# Gateway's "web" HTTPRoute:
+#
+#   A  plain HTTP to the Gateway ClusterIP
+#        -> does a pod reach the Gateway at all? who is logged as the client?
+#   B  forged PROXY v1 to the Gateway ClusterIP
+#        -> can a pod claim an arbitrary client IP on the service path?
+#   C  forged PROXY v1 to the node's Gateway address
+#        -> can a pod claim an arbitrary client IP on the direct node path?
+#
+# A fourth connection (D) is made from the node's own host network
+# namespace, over loopback:
+#
+#   D  forged PROXY v1 to 127.0.0.1:80
+#        -> can an UNPRIVILEGED local user on a node claim a client IP?
+#
+# D is the vector that actually worked on 2026-11-02: the K8SGW chain
+# allowed `-s 127.0.0.1`, so any local process could reach Envoy's PROXY
+# filter. The loopback exception was removed from the gateway_firewall
+# role; this probe keeps that regression covered.
+#
+# Every request carries a distinguishing Host header, so probe traffic
+# can be told apart from real traffic in the Envoy access log without
+# depending on the pod's IP (which changes on every run).
+#
+# Verdict is decided from the Envoy access log, not from the probe's exit
+# codes:
+#   FORGE SUCCEEDED  -> a probe line carries a forged client IP
+#   FORGE REWRITTEN  -> a probe line carries the real client IP instead
+#   FORGE BLOCKED    -> no probe line at all; the request never reached Envoy
+#
+# The pod does the work itself at startup and we read its log; no
+# `kubectl exec` is involved.
+- name: Probe in-cluster PROXY header forgery
+  hosts: node-01
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+    probe_namespace: default
+    probe_name: forge-probe
+    probe_image: alpine:3.20
+    forged_client_ip: 203.0.113.77
+    forged_loopback_ip: 203.0.113.99
+    gateway_service: cilium-gateway-web
+    gateway_namespace: web
+    probe_host: forge-probe.invalid
+    # Must not contain probe_host as a substring — the log lines are found
+    # with a regex `search`, so overlapping markers would double-count.
+    loopback_probe_host: forgeloop.invalid
+    probe_request: >-
+      GET / HTTP/1.1\r\nHost: {{ probe_host }}\r\nConnection: close\r\n\r\n
+    probe_forged_request: >-
+      PROXY TCP4 {{ forged_client_ip }} 10.42.9.99 40000 80\r\n{{ probe_request }}
+    loopback_probe_request: >-
+      GET / HTTP/1.1\r\nHost: {{ loopback_probe_host }}\r\nConnection: close\r\n\r\n
+    loopback_forged_request: >-
+      PROXY TCP4 {{ forged_loopback_ip }} 127.0.0.1 40000 80\r\n{{ loopback_probe_request }}
+  tasks:
+    - name: Read the Gateway service ClusterIP
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ gateway_namespace }}
+          get svc {{ gateway_service }}
+          -o jsonpath={.spec.clusterIP}
+      register: gateway_svc
+      changed_when: false
+
+    - name: Read the Gateway node addresses
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ gateway_namespace }}
+          get gateway web
+          -o jsonpath={.status.addresses[0].value}
+      register: gateway_addr
+      changed_when: false
+
+    - name: Remove any previous probe pod
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          delete pod {{ probe_name }} --ignore-not-found
+      changed_when: false
+
+    # Baseline the access log so the verdict is about THIS run only.
+    - name: Snapshot the Envoy access log
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n kube-system logs
+          -l k8s-app=cilium-envoy --all-containers --tail=500 --prefix
+      register: envoy_before
+      changed_when: false
+
+    # Vector D: the loopback forge, from the node's own host network
+    # namespace. This is the vector that worked on 2026-11-02 — an
+    # unprivileged local process on a node could write an arbitrary client
+    # IP into the access log, because K8SGW allowed `-s 127.0.0.1`.
+    - name: Attempt the loopback PROXY forgery from the node itself
+      ansible.builtin.shell:
+        cmd: >-
+          printf '{{ loopback_forged_request }}'
+          | timeout 5 nc 127.0.0.1 80 2>&1 || echo "LOOPBACK_REFUSED rc=$?"
+        executable: /bin/bash
+      register: loopback_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Show what the loopback forgery attempt returned
+      ansible.builtin.debug:
+        msg: "{{ loopback_probe.stdout_lines | default(['(no output)']) }}"
+
+    - name: Build the probe script
+      ansible.builtin.set_fact:
+        probe_script: >-
+          echo "=== A: plain HTTP to the ClusterIP ===";
+          printf "{{ probe_request }}" | nc -w 5 {{ gateway_svc.stdout }} 80; echo "RC_A=$?";
+          echo "=== B: forged PROXY to the ClusterIP ===";
+          printf "{{ probe_forged_request }}" | nc -w 5 {{ gateway_svc.stdout }} 80; echo "RC_B=$?";
+          echo "=== C: forged PROXY to the node address ===";
+          printf "{{ probe_forged_request }}" | nc -w 5 {{ gateway_addr.stdout }} 80; echo "RC_C=$?"
+        probe_marked_lines: >-
+          {{ (envoy_before.stdout_lines | select('search', probe_host) | list)
+             + (envoy_before.stdout_lines | select('search', loopback_probe_host) | list) }}
+
+    # The script is single-quoted so that the pod's shell — not the
+    # workstation — expands $?. Without the quotes the exit code is lost
+    # and the probe cannot tell "refused" from "timed out".
+    - name: Run the forgery probe pod
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          run {{ probe_name }}
+          --image={{ probe_image }}
+          --restart=Never
+          --image-pull-policy=IfNotPresent
+          --command
+          -- sh -c '{{ probe_script }}'
+      register: probe_start
+      changed_when: true
+
+    - name: Wait for the probe pod to finish
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          wait --for=jsonpath='{.status.phase}'=Succeeded
+          pod/{{ probe_name }} --timeout=180s
+      register: probe_wait
+      changed_when: false
+      failed_when: false
+      retries: 18
+      delay: 10
+      until: probe_wait.rc == 0
+
+    - name: Read the probe pod log
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          logs {{ probe_name }} --tail=60
+      register: probe_log
+      changed_when: false
+      failed_when: false
+
+    - name: Show what the probe pod got back
+      ansible.builtin.debug:
+        msg: "{{ probe_log.stdout_lines | default(['(no output)']) }}"
+
+    - name: Show which node the probe pod ran on
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          get pod {{ probe_name }} -o wide
+      register: probe_pod
+      changed_when: false
+
+    - name: Print the probe pod placement
+      ansible.builtin.debug:
+        msg: "{{ probe_pod.stdout_lines }}"
+
+    - name: Read the Envoy access log after the probe
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n kube-system logs
+          -l k8s-app=cilium-envoy --all-containers --tail=500 --prefix
+      register: envoy_after
+      changed_when: false
+
+    - name: Collect the probe lines from the Envoy access log
+      ansible.builtin.set_fact:
+        probe_lines: >-
+          {{ (envoy_after.stdout_lines | select('search', probe_host) | list)
+             + (envoy_after.stdout_lines | select('search', loopback_probe_host) | list) }}
+
+    - name: Count the new probe lines in the Envoy access log
+      ansible.builtin.set_fact:
+        probe_new_lines: "{{ (probe_lines | length) - (probe_marked_lines | length) }}"
+
+    - name: Show the new probe lines
+      ansible.builtin.debug:
+        msg: "{{ probe_lines }}"
+
+    - name: Read the Gateway firewall counters
+      ansible.builtin.command:
+        cmd: iptables -t filter -L K8SGW -n -v
+      register: gw_counters
+      changed_when: false
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['control_plane'] }}"
+
+    # The Gateway has to still be serving after the probe — the probe is
+    # only meaningful if the real path is intact. `show stat` over the
+    # admin unix socket needs no HTTP client.
+    - name: Read the HAProxy backend states from the admin socket
+      ansible.builtin.shell:
+        cmd: |
+          python3 - <<'PY'
+          import socket
+          s = socket.socket(socket.AF_UNIX)
+          s.connect('/var/run/haproxy-admin.sock')
+          s.sendall(b'show stat\n')
+          data = b''
+          while True:
+              chunk = s.recv(65536)
+              if not chunk:
+                  break
+              data += chunk
+          for line in data.decode().splitlines():
+              if line.startswith('#'):
+                  continue
+              f = line.split(',')
+              if f[0] not in ('k8s-http', 'k8s-https'):
+                  continue
+              if f[1] in ('FRONTEND', 'BACKEND'):
+                  print(f"# {f[0]} {f[1]} {f[17]}")
+                  continue
+              print(f"{f[0]},{f[1]},{f[17]}")
+          PY
+        executable: /bin/bash
+      register: haproxy_stats
+      retries: 10
+      delay: 3
+      until: haproxy_stats.rc == 0
+      changed_when: false
+      delegate_to: edge-01
+
+    - name: Show the Gateway backend states
+      ansible.builtin.debug:
+        msg: "{{ haproxy_stats.stdout_lines }}"
+
+    - name: Fail when a Gateway backend server is not UP
+      ansible.builtin.fail:
+        msg: >-
+          A Gateway backend server is not UP:
+          {{ haproxy_stats.stdout_lines | reject('search', 'UP') | list }}
+      when: >-
+        haproxy_stats.stdout_lines | reject('search', '^#') | list | length > 0
+        and (haproxy_stats.stdout_lines | reject('search', '^#') | list
+             | reject('search', 'UP') | list | length) > 0
+
+    - name: Show the firewall counters
+      ansible.builtin.debug:
+        msg: "{{ gw_counters.results | map(attribute='stdout_lines') | list }}"
+
+    # `| ternary` binds tighter than `>`, so the comparison has to be
+    # parenthesised before the filter is applied to it.
+    - name: Decide the verdict
+      ansible.builtin.set_fact:
+        forge_verdict: >-
+          {% if (probe_lines | select('search', forged_client_ip) | list | length) > 0 %}
+          FORGE SUCCEEDED — the Gateway logged the forged client IP {{ forged_client_ip }} for a probe request
+          {% elif (probe_lines | select('search', forged_loopback_ip) | list | length) > 0 %}
+          FORGE SUCCEEDED — the Gateway logged the forged client IP {{ forged_loopback_ip }} for the loopback probe request
+          {% elif (probe_new_lines | int) > 0 %}
+          FORGE REWRITTEN — {{ probe_new_lines }} probe request(s) reached the Gateway, none carrying a forged client IP
+          {% else %}
+          FORGE BLOCKED — no probe request reached the Gateway
+          {% endif %}
+
+    - name: Report the result
+      ansible.builtin.debug:
+        msg: "{{ forge_verdict }}"
+
+    - name: Remove the probe pod
+      ansible.builtin.command:
+        cmd: >-
+          kubectl --kubeconfig={{ kubeconfig }} -n {{ probe_namespace }}
+          delete pod {{ probe_name }} --ignore-not-found
+      changed_when: false

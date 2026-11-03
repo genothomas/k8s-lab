@@ -1,0 +1,29 @@
+---
+# Apply (or re-assert) the Gateway listener firewall on the control-plane
+# nodes.
+#
+# Kept as a standalone playbook because the ordering of the K8SGW jump in
+# the INPUT chain drifts: cilium-agent re-inserts its own CILIUM_INPUT
+# jump at position 1 whenever it reconciles its rules, pushing K8SGW down
+# the chain where the mark-0x200 ACCEPT preempts it. Run this after any
+# cilium rollout to put it back.
+- name: Apply the Gateway listener firewall
+  hosts: control_plane
+  become: true
+  roles:
+    - gateway_firewall
+
+- name: Report the INPUT chain order
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: Show the first rules of the INPUT chain
+      ansible.builtin.shell:
+        cmd: iptables -t filter -S INPUT | head -4
+        executable: /bin/bash
+      register: input_order
+      changed_when: false
+
+    - name: Print the INPUT chain order
+      ansible.builtin.debug:
+        msg: "{{ input_order.stdout_lines }}"

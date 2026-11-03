@@ -20,7 +20,10 @@ Ansible owns node configuration and cluster bootstrap.
 | `haproxy.yml` | edge | haproxy |
 | `kubernetes.yml` | control_plane + workers | common, containerd, kubernetes |
 | `cluster.yml` | node-01 (init/cni) + node-02,node-03 (join) | kubeadm, cni |
-| `cluster-gateway.yml` | control_plane | Cilium Gateway API CRDs + `web` Gateway + envoy host-port check |
+| `cluster-gateway.yml` | control_plane | Cilium Gateway API CRDs + `web` Gateway + envoy host-port check + firewall re-assert |
+| `gateway-firewall.yml` | control_plane | `gateway_firewall` — re-applies the rule set and puts the `K8SGW` jump back in first position |
+| `gateway-proxy-protocol.yml` | control_plane + edge | PROXY v2 cutover: firewall → Cilium → edge reload |
+| `gateway-forge-probe.yml` | node-01 | diagnostic — in-cluster PROXY-header forgery probe |
 | `cluster-cert.yml` | node-01 | cert-manager (Helm) + ClusterIssuer + Certificate (`enable_dns=true` → DNS-01/Cloudflare, else HTTP-01) |
 | `cluster-observability.yml` | node-01 | VictoriaMetrics stack via `victoria-metrics-k8s-stack` + `vm-overrides.yaml` |
 | `cluster-demo.yml` | node-01 | `podinfo` Deployment/Service/HTTPRoute in `demo` namespace |
@@ -280,35 +283,141 @@ check connection arrives without a header and Envoy closes it.
   per-Gateway. It installs Envoy's `proxy_protocol` listener filter with
   `allow_requests_without_proxy_protocol` unset (i.e. false), so **only
   connections carrying a PROXY header are accepted**. Consequences:
-  - ClusterIP, NodePort and direct-node access to the Gateway **stop working**
-    (the in-cluster probe recipe below is dead — use the edge instead);
+  - ClusterIP, NodePort and direct-node access to the Gateway **stop serving**
+    (a client without a PROXY header is closed before the request is parsed);
+    the edge is the only path that works;
   - it applies to every Gateway listener in the cluster, not just the web one;
   - the PROXY header is **not authenticated** — anything that can reach a
     node's `:80`/`:443` can forge a client IP. Hence the `gateway_firewall`
-    role, which drops everything except the edge.
+    role, which drops everything except the edge. The edge itself remains
+    trusted by construction: PROXY protocol v2 has no authentication, so a
+    compromised edge can still claim any client address. Closing that would
+    need a mechanism Cilium's listener filter does not offer.
 - The Kubernetes API port (6443) is untouched — the API backends keep plain
   TCP.
 
 **Why the `K8SGW` jump must be the FIRST rule in `INPUT`**
 
-Cilium re-inserts its own `CILIUM_INPUT` jump at position 1 of `INPUT` every
-time the agent restarts, which pushes `K8SGW` down the chain.
 `CILIUM_INPUT` contains exactly one rule:
 
 ```
--A CILIUM_INPUT -m mark --mark 0x200/0xf00 -j ACCEPT
+-A CILIUM_INPUT -m mark --mark 0x200/0xf00 -m comment --comment "cilium: ACCEPT for proxy traffic" -j ACCEPT
 ```
 
-That accepts Cilium-proxied traffic (mark `0x200`). If `K8SGW` sits behind
-it, in-cluster traffic that reaches the Gateway over Cilium's proxy path is
-ACCEPTed before the `K8SGW` DROP rules are ever evaluated — and such a
-connection could smuggle its own PROXY header and forge a client IP.
+That accepts Cilium-proxied traffic (mark `0x200`, set by `CILIUM_PRE_mangle`
+for anything redirected to the host proxy). If `K8SGW` sits behind it, that
+traffic is ACCEPTed before the `K8SGW` DROP rules are ever evaluated.
 
-The role therefore re-asserts the jump position on every run
-(`Ensure the K8SGW jump is the first rule in INPUT`): it deletes the
-misplaced jump and re-inserts it at position 1. Do not "simplify" that task
-away — `iptables -I INPUT 1` alone is not enough, because the ordering
-decays again on the next Cilium restart.
+Cilium inserts its own jump at position 1 of `INPUT` and **the ordering
+decays on its own** — measured on the running lab: the `K8SGW` jump was
+verified in first position, and was back at position 2 later with the
+cilium agents showing **0 restarts** (4h uptime). So this is not only an
+agent-restart problem.
+
+The role re-asserts the jump position on every run (`Ensure the K8SGW jump
+is the first rule in INPUT`): it deletes the misplaced jump and re-inserts
+it at position 1. Do not "simplify" that task away — `iptables -I INPUT 1`
+alone is not enough, because the ordering decays again without a restart.
+
+Re-assert it on demand:
+
+```bash
+make local-gateway-firewall   # re-apply the rule set and the jump position
+```
+
+**In-cluster forgery — what the measurements show**
+
+The PROXY header is not authenticated, so *anything* that can open a
+connection to a Gateway listener can claim an arbitrary client address. The
+question is which actors can actually get there. Measured on the running
+lab (2026-11-02/03) with `make local-gateway-probe`, which sends requests
+from a throwaway pod and from the node's own host network namespace, and
+decides the verdict from the Envoy access log:
+
+| Path | `K8SGW` first (ordered) | `CILIUM_INPUT` first (drifted) |
+|------|------------------------|-------------------------------|
+| pod → Gateway ClusterIP, plain HTTP | connection refused, `DROP :80` +5 | TCP connects (`rc=0`), no response |
+| pod → Gateway ClusterIP, forged PROXY v1 | connection refused, `DROP :80` +5 | TCP connects (`rc=0`), no response |
+| pod → node address `:80`, forged PROXY v1 | connection refused, `DROP :80` +5 | connection refused, `DROP :80` +5 |
+| any pod → Envoy access log | no entry | **no entry** |
+| node loopback → `127.0.0.1:80`, forged PROXY v1 | **forged** (see below) | **forged** (see below) |
+
+Conclusions:
+
+- Pod traffic **does** traverse the node's `INPUT` chain — an earlier claim in
+  this file that it "never traverses INPUT, so the node firewall cannot see
+  it" was wrong. It is dropped by `K8SGW` whenever the jump is in front.
+- In the drifted state a pod can still open a TCP connection to the Gateway
+  ClusterIP, but **the pod's bytes never reach Envoy's PROXY filter**: no
+  access-log line is written, neither for a plain request nor for a forged
+  PROXY header. The connection is accepted by something that is not Envoy's
+  listener. So the pod cannot poison the log in either ordering.
+- **The loopback path was a real forge hole, and it was open.** The `K8SGW`
+  chain carried `-s 127.0.0.1 ACCEPT`, so any local process on a control
+  plane — **no root required** — could reach Envoy's PROXY filter and write
+  an arbitrary client IP into the access log. Measured on 2026-11-02 from
+  `node-02`:
+  ```
+  printf 'PROXY TCP4 203.0.113.99 127.0.0.1 40000 80\r\nGET / HTTP/1.1\r\nHost: demo.svc.dotunet.com\r\n\r\n' | nc 127.0.0.1 80
+  → HTTP/1.1 301 Moved Permanently
+  → Envoy log: "remote_address":"203.0.113.99:40000","x_forwarded_for":"203.0.113.99"
+  ```
+  That is an escalation, not a non-escalation: the point of the access log
+  is to attribute a request to a client, and any user with a shell on a node
+  could attribute it to anyone.
+  The rule was introduced in commit `64cc67a` with no recorded justification,
+  and it was unused: over the whole life of the chain the loopback counters
+  sat at **0 packets on node-03** (while 31490 packets of edge traffic
+  passed) and **1 packet on node-01** (a probe of our own).
+  The rule is now off by default (`gateway_firewall_allow_loopback: false`),
+  the role actively **removes** it where it already exists, and it asserts
+  afterwards that no loopback ACCEPT survived.
+
+So: **no in-cluster forgery hole remains**, and the controls that close it
+are the `K8SGW` jump position plus the absence of any loopback exception.
+
+**The `CiliumNetworkPolicy` that was tried and removed**
+
+A per-namespace egress deny ("allow every destination except the Gateway",
+excluding both the ClusterIP `10.43.109.166` and the magic backend address
+`192.192.192.192`) was implemented and applied — five namespaces, all
+`VALID=True` — and **it did not deny anything**: the probe pod still
+connected (`rc=0`). Cilium evaluates the egress rule *after* service
+translation, where the destination is the Gateway's **node address**
+(`192.168.16.25`), not the ClusterIP and not `192.192.192.192`, so neither
+exclusion matched. Excluding the node addresses instead would also exclude
+the Kubernetes API server on `192.168.16.25:6443` — that breaks
+cert-manager and every controller in the affected namespaces.
+
+It was therefore removed rather than shipped: a policy that claims to deny
+something it does not deny is worse than no policy.
+
+**Controls**
+
+1. `gateway_firewall` role — node firewall, for everything that goes
+   through `INPUT`. The `K8SGW` jump must stay the **first** rule in
+   `INPUT` (see above); `make local-gateway-firewall` re-asserts it.
+   The chain accepts **only** the edge address — including from the node
+   itself, since loopback is a forge path (see above). If a measured need
+   for loopback ever appears, `gateway_firewall_allow_loopback: true` turns
+   it back on; the role then asserts that no loopback ACCEPT is left over
+   when the flag is off, so the exception cannot survive silently on a node
+   that was configured earlier.
+2. Envoy's PROXY listener filter — a connection without a PROXY header is
+   closed before any request is parsed, so a plain client cannot be logged
+   at all.
+
+```bash
+make local-gateway-firewall   # re-assert the firewall + jump position
+make local-gateway-probe      # probe whether a pod can still forge a header
+```
+
+The probe creates a throwaway pod that sends a plain request and two forged
+PROXY headers, and separately attempts a forged PROXY header over loopback
+from the node itself, then reports `FORGE SUCCEEDED` / `FORGE REWRITTEN` /
+`FORGE BLOCKED` from the Envoy access log. It also asserts that the Gateway
+is still serving (all six HAProxy backends `UP`). It is a diagnostic, not an
+access mechanism — the pod is deleted at the end.
 
 **Cutover**
 

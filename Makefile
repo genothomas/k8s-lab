@@ -18,7 +18,7 @@ WAIT_TIMEOUT  ?= 360
 WAIT_INTERVAL ?= 10
 
 .PHONY: all help check ping terraform inventory bootstrap k8s cni gateway cert observability demo haproxy clean destroy nuke wait-ready test \
-        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-gateway-proxy local-cert local-observability local-demo local-test local-cleanup local-cleanup-snapshot local-all
+        local-check local-prep local-bootstrap local-haproxy local-k8s local-cluster local-gateway local-gateway-proxy local-gateway-firewall local-gateway-probe local-cert local-observability local-demo local-test local-cleanup local-cleanup-snapshot local-all
 
 .DEFAULT_GOAL := check
 
@@ -169,6 +169,20 @@ local-gateway: local-check
 local-gateway-proxy: local-check
 	$(LOCAL_ANS) ansible/playbooks/gateway-proxy-protocol.yml
 
+# Re-assert the Gateway listener firewall. The K8SGW jump has to be the
+# FIRST rule in INPUT: cilium-agent re-inserts its own CILIUM_INPUT jump
+# at position 1 whenever it reconciles its rules, pushing K8SGW down the
+# chain where the mark-0x200 ACCEPT preempts it. Run this after any
+# cilium rollout.
+local-gateway-firewall: local-check
+	$(LOCAL_ANS) ansible/playbooks/gateway-firewall.yml
+
+# Probe whether an in-cluster pod can forge a client IP in the Gateway
+# access log. Creates a throwaway pod, reports FORGE SUCCEEDED /
+# REWRITTEN / BLOCKED, then deletes the pod.
+local-gateway-probe: local-check
+	$(LOCAL_ANS) ansible/playbooks/gateway-forge-probe.yml
+
 # DNS-01 via Cloudflare: needs a real zone in the inventory AND the token
 # in the environment. The token is written straight into a cert-manager
 # Secret — it is never stored in the repo.
@@ -271,6 +285,8 @@ help:
 	@echo "  local-cluster       - cluster.yml (kubeadm init, Cilium, joins)"
 	@echo "  local-gateway       - cluster-gateway.yml (Gateway API + web Gateway)"
 	@echo "  local-gateway-proxy - gateway-proxy-protocol.yml (PROXY v2 cutover, brief outage)"
+	@echo "  local-gateway-firewall - gateway-firewall.yml (re-assert K8SGW jump order in INPUT)"
+	@echo "  local-gateway-probe - gateway-forge-probe.yml (probe in-cluster PROXY header forgery)"
 	@echo "  local-cert          - cluster-cert.yml (cert-manager + LE, needs CLOUDFLARE_API_TOKEN)"
 	@echo "  local-observability - cluster-observability.yml (VictoriaMetrics stack)"
 	@echo "  local-demo          - cluster-demo.yml (podinfo demo)"

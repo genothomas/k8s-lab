@@ -77,6 +77,17 @@
         comment: "k8s-lab: edge HAProxy -> Gateway listener"
       loop: "{{ gateway_firewall_listener_ports }}"
 
+    # Loopback to the Gateway listeners is a PROXY-header forgery path:
+    # loopback traffic reaches Envoy's PROXY filter, and the header is
+    # unauthenticated, so ANY local user on the node (no root required)
+    # can write an arbitrary client IP into the access log. Measured
+    # 2026-11-02 on node-02: a forged PROXY header over 127.0.0.1 was
+    # logged by Envoy as "remote_address":"203.0.113.99".
+    #
+    # Nothing legitimate uses it (loopback counters sat at 0 packets on
+    # node-03 while 31490 edge packets passed), so it is off by default
+    # and the rule is actively REMOVED when it is off — otherwise the
+    # forge path would survive on every node that was configured before.
     - name: Allow the node itself to reach the Gateway listeners
       ansible.builtin.iptables:
         chain: "{{ gateway_firewall_chain }}"
@@ -85,6 +96,7 @@
         destination_port: "{{ item }}"
         jump: ACCEPT
         comment: "k8s-lab: loopback -> Gateway listener"
+        state: "{{ 'present' if gateway_firewall_allow_loopback | bool else 'absent' }}"
       loop: "{{ gateway_firewall_listener_ports }}"
 
     - name: Drop every other connection to the Gateway listeners
@@ -113,6 +125,30 @@
         cache_valid_time: 3600
       environment:
         DEBIAN_FRONTEND: noninteractive
+
+    # The forge path must stay closed. Assert it rather than trusting that
+    # the rule above was applied — the whole point of the loopback rule
+    # was that it looked harmless.
+    #
+    # The pattern matches ANY rule whose source is a loopback address
+    # (127.0.0.0/8 in any prefix length) and whose target is ACCEPT, so a
+    # future rule written as `-s 127.0.0.0/8` cannot slip past the check.
+    - name: Assert that no loopback exception survived in the chain
+      ansible.builtin.shell:
+        cmd: >-
+          iptables -t filter -S {{ gateway_firewall_chain }}
+          | grep -E -- '-s 127\.[0-9.]+/[0-9]+ .*-j ACCEPT' | wc -l
+        executable: /bin/bash
+      register: loopback_accepts
+      changed_when: false
+
+    - name: Fail when the chain still accepts loopback traffic
+      ansible.builtin.fail:
+        msg: >-
+          {{ gateway_firewall_chain }} still has a loopback ACCEPT rule.
+          Any local user on this node can forge a client IP in the Gateway
+          access log through it.
+      when: (loopback_accepts.stdout | int) > 0
 
     - name: Persist iptables rules across reboot
       ansible.builtin.command:

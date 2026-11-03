@@ -15,6 +15,20 @@ gateway_firewall_listener_ports:
   - 80
   - 443
 
+# Allow the node itself (127.0.0.1) to reach the Gateway listeners.
+#
+# OFF by default, and it must stay off unless a measured need appears.
+# Loopback traffic reaches Envoy's PROXY-protocol filter, and the PROXY
+# header is unauthenticated — so this rule lets ANY local user on the node
+# (no root required) write an arbitrary client IP into the Gateway access
+# log. Measured 2026-11-02 on node-02: a forged PROXY header sent over
+# loopback was logged by Envoy as "remote_address":"203.0.113.99".
+#
+# Nothing in the lab needs it: over the whole life of the chain, the
+# loopback counters sat at 0 packets on node-03 (while 31490 packets of
+# edge traffic passed) and 1 packet on node-01 (a probe of our own).
+gateway_firewall_allow_loopback: false
+
 # NodePorts of the Cilium-managed Gateway Service. They are an alternative
 # path to the same PROXY-required listeners, so they are closed as well.
 gateway_firewall_nodeports:

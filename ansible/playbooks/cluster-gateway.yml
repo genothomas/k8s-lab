@@ -300,3 +300,28 @@
                   CiliumGatewayClassConfig/gateway-access-logs, and Envoy
                   access logs appear on:
                   kubectl -n kube-system logs ds/cilium-envoy -f --prefix
+
+# The Cilium rollout above restarts the agents, and cilium-agent re-inserts
+# its own CILIUM_INPUT jump at position 1 of INPUT — not only on restart but
+# whenever it reconciles its rules (measured: the jump drifted back to
+# position 2 with the agents showing 0 restarts). That pushes the K8SGW jump
+# down the chain, where Cilium's mark-0x200 ACCEPT preempts it.
+# Re-apply the firewall here so the jump ends up back in first position.
+- name: Re-assert the Gateway firewall after the Cilium rollout
+  hosts: control_plane
+  become: true
+  roles:
+    - gateway_firewall
+
+# The node firewall cannot see in-cluster traffic to the Gateway when the
+# K8SGW jump is not the first rule in INPUT: cilium-agent re-inserts its
+# own CILIUM_INPUT jump at position 1 whenever it reconciles its rules,
+# and that chain ACCEPTs proxy-marked traffic before K8SGW ever sees it.
+# The re-assert above puts K8SGW back in front, which is what actually
+# stops pod traffic (measured: the node firewall drops it).
+#
+# A CiliumNetworkPolicy deny was tried here and removed: Cilium evaluates
+# the egress rule after service translation, where the destination is the
+# Gateway's node address rather than the ClusterIP, so the policy never
+# matched. Excluding the node addresses instead would also exclude the
+# API server on the same address. See ansible/README.md.
